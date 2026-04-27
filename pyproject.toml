@@ -1,0 +1,12 @@
+[project]
+name = "agent-communicator"
+version = "0.1.0"
+description = "Agent 原生协作层 — 让 Coding Agent 拥有身份、广播、点对点、群组的通信能力"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.136.1",
+    "pydantic>=2.13.3",
+    "redis>=7.4.0",
+    "requests>=2.33.1",
+    "uvicorn>=0.46.0",
+]
