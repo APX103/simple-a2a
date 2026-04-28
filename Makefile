@@ -4,7 +4,7 @@ install:
 	uv sync
 
 dev:
-	uv run uvicorn agent_bus.main:app --host 0.0.0.0 --port 10080 --reload
+	uv run uvicorn agent_bus.main:app --host 0.0.0.0 --port 18080 --reload
 
 redis:
 	docker compose up -d redis

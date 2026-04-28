@@ -17,7 +17,7 @@ uv sync
 ```bash
 make dev
 # 或
-uv run uvicorn agent_bus.main:app --host 0.0.0.0 --port 10080 --reload
+uv run uvicorn agent_bus.main:app --host 0.0.0.0 --port 18080 --reload
 ```
 
 ### 3. 启动服务（Redis 后端）
@@ -30,7 +30,7 @@ make redis
 REDIS_URL=redis://localhost:6379/0 make dev
 ```
 
-服务启动后，OpenAPI 文档位于 http://127.0.0.1:10080/docs。
+服务启动后，OpenAPI 文档位于 http://127.0.0.1:18080/docs。
 
 ### 4. 运行客户端演示
 
@@ -129,7 +129,7 @@ make demo         # 运行客户端演示
 ### 1. 服务发现（Manifest）
 
 ```bash
-curl http://127.0.0.1:10080/
+curl http://127.0.0.1:18080/
 ```
 
 返回完整的自描述 JSON，包含：
@@ -142,14 +142,14 @@ curl http://127.0.0.1:10080/
 ### 2. 一键下发 SDK
 
 ```bash
-curl http://127.0.0.1:10080/sdk
+curl http://127.0.0.1:18080/sdk
 ```
 
 返回可直接保存为 `agent_bus_sdk.py` 的 Python 客户端类 `AgentBusClient`，封装了注册、发消息、轮询收件箱、群组管理全部操作。
 
 ### AI 接入流程
 
-1. 你给 AI 一个 URL：`http://<host>:10080`
+1. 你给 AI 一个 URL：`http://<host>:18080`
 2. AI `GET /` → 读取 manifest，执行 `uv add requests`
 3. AI `GET /sdk` → 保存 `AgentBusClient` 到本地
 4. AI 按 manifest 中的 `registration` 说明调用 `.register(...)`
