@@ -126,7 +126,8 @@ X-Token: <注册时返回的 token>
 ## 部署建议
 
 - **开发/内网**：直接 `make dev` 启动，内网可达即可。默认使用内存存储，重启后数据丢失。
-- **多实例/持久化**：设置环境变量 `REDIS_URL=redis://...` 切换到 Redis 后端，配合 `docker compose up -d redis` 使用。
+- **持久化（推荐）**：设置环境变量 `MONGODB_URL=mongodb://localhost:27017` 使用 MongoDB 后端，Agent、消息、群组全量持久化，支持 Dashboard 统计查询。
+- **多实例/Redis**：设置环境变量 `REDIS_URL=redis://...` 切换到 Redis 后端。
 - **无公网 IP**：使用 Cloudflare Tunnel 或 ngrok 暴露。
 - **生产**：前置 Nginx / Caddy，启用 HTTPS。
 

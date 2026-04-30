@@ -1,4 +1,4 @@
-"""Store backends for Agent Bus — memory (default) or Redis."""
+"""Store backends for Agent Bus — memory (default), Redis, or MongoDB."""
 from __future__ import annotations
 
 import os
@@ -356,375 +356,273 @@ class RedisStore(BaseStore):
         return True
 
 
-class SQLiteStore(BaseStore):
-    """SQLite-backed store via SQLAlchemy."""
+class MongoStore(BaseStore):
+    """MongoDB-backed store."""
 
-    def __init__(self, db_session_factory) -> None:
-        self._session_factory = db_session_factory
+    def __init__(self, mongo_url: str = "mongodb://localhost:27017", db_name: str = "agent_bus") -> None:
+        from pymongo import MongoClient
+        from pymongo.server_api import ServerApi
 
-    def _sess(self) -> "Session":
-        from sqlalchemy.orm import Session
-        return self._session_factory()
+        self._client = MongoClient(mongo_url, server_api=ServerApi('1'))
+        self._db = self._client[db_name]
+        self._agents = self._db["agents"]
+        self._messages = self._db["messages"]
+        self._groups = self._db["groups"]
+        # Ensure indexes
+        self._agents.create_index("agent_id", unique=True)
+        self._messages.create_index([("to_agent_id", 1), ("timestamp", -1)])
+        self._groups.create_index("group_id", unique=True)
+
+    def _next_id(self, prefix: str) -> str:
+        ts = int(time.time())
+        rand = secrets.token_hex(4)
+        return f"{prefix}_{ts}_{rand}"
 
     @staticmethod
-    def _to_card(agent) -> AgentCard:
+    def _card_from_doc(doc: dict) -> AgentCard:
         return AgentCard(
-            agent_id=agent.agent_id,
-            name=agent.name,
-            capabilities=agent.capabilities or [],
-            limitations=agent.limitations or [],
-            labels=agent.labels or [],
-            announcement=agent.announcement or "",
-            online=agent.online,
-            registered_at=agent.registered_at,
-            last_seen=agent.last_seen,
+            agent_id=doc["agent_id"],
+            name=doc["name"],
+            capabilities=doc.get("capabilities", []),
+            limitations=doc.get("limitations", []),
+            labels=doc.get("labels", []),
+            announcement=doc.get("announcement", ""),
+            online=doc.get("online", True),
+            registered_at=doc.get("registered_at", datetime.utcnow()),
+            last_seen=doc.get("last_seen", datetime.utcnow()),
         )
 
     @staticmethod
-    def _json_safe(obj):
-        import json
-        if obj is None:
-            return None
-        return json.loads(json.dumps(obj, default=str))
-
-    @staticmethod
-    def _to_msg(msg) -> Message:
+    def _msg_from_doc(doc: dict) -> Message:
         return Message(
-            msg_id=msg.msg_id,
-            msg_type=msg.msg_type,
-            from_agent=msg.from_agent,
-            to=msg.to,
-            content=MessageContent(summary=msg.content_summary or "", detail=msg.content_detail),
-            require_human_confirm=msg.require_human_confirm,
-            human_confirmed=msg.human_confirmed,
-            read_at=msg.read_at,
-            delivered_at=msg.delivered_at,
-            timestamp=msg.timestamp,
+            msg_id=doc["msg_id"],
+            msg_type=doc["msg_type"],
+            from_agent=doc["from_agent"],
+            to=doc["to"],
+            content=MessageContent(summary=doc.get("content_summary", ""), detail=doc.get("content_detail")),
+            require_human_confirm=doc.get("require_human_confirm", False),
+            human_confirmed=doc.get("human_confirmed"),
+            read_at=doc.get("read_at"),
+            delivered_at=doc.get("delivered_at", datetime.utcnow()),
+            timestamp=doc.get("timestamp", datetime.utcnow()),
         )
 
     @staticmethod
-    def _to_group(group) -> Group:
+    def _group_from_doc(doc: dict) -> Group:
         return Group(
-            group_id=group.group_id,
-            name=group.name,
-            members=[m.agent_id for m in group.members],
-            created_by=group.created_by,
-            created_at=group.created_at,
+            group_id=doc["group_id"],
+            name=doc["name"],
+            members=doc.get("members", []),
+            created_by=doc["created_by"],
+            created_at=doc.get("created_at", datetime.utcnow()),
         )
 
     def register_agent(
         self, name: str, capabilities: List[str], limitations: List[str], announcement: str, labels: List[str] = None
     ) -> tuple[str, str, AgentCard]:
-        from agent_bus.db import AgentORM
-
-        agent_id = f"agent_{int(time.time())}_{secrets.token_hex(4)}"
+        agent_id = self._next_id("agent")
         token = secrets.token_urlsafe(32)
-        with self._sess() as sess:
-            agent = AgentORM(
-                agent_id=agent_id,
-                name=name,
-                capabilities=capabilities or [],
-                limitations=limitations or [],
-                labels=labels or [],
-                announcement=announcement,
-                token=token,
-            )
-            sess.add(agent)
-            sess.commit()
-            return agent_id, token, self._to_card(agent)
+        now = datetime.now(timezone.utc)
+        doc = {
+            "agent_id": agent_id,
+            "name": name,
+            "capabilities": capabilities or [],
+            "limitations": limitations or [],
+            "labels": labels or [],
+            "announcement": announcement,
+            "online": True,
+            "registered_at": now,
+            "last_seen": now,
+            "token": token,
+        }
+        self._agents.insert_one(doc)
+        return agent_id, token, self._card_from_doc(doc)
 
     def get_agent(self, agent_id: str) -> Optional[AgentCard]:
-        from agent_bus.db import AgentORM
-
-        with self._sess() as sess:
-            agent = sess.get(AgentORM, agent_id)
-            return self._to_card(agent) if agent else None
+        doc = self._agents.find_one({"agent_id": agent_id})
+        return self._card_from_doc(doc) if doc else None
 
     def list_agents(self, label: Optional[str] = None) -> List[AgentCard]:
-        from agent_bus.db import AgentORM
-        from sqlalchemy import select
-
-        with self._sess() as sess:
-            stmt = select(AgentORM)
-            agents = sess.execute(stmt).scalars().all()
-            result = [self._to_card(a) for a in agents]
-            if label:
-                result = [a for a in result if label in a.labels]
-            return result
+        query = {}
+        if label:
+            query["labels"] = label
+        docs = self._agents.find(query)
+        return [self._card_from_doc(d) for d in docs]
 
     def verify_token(self, agent_id: str, token: str) -> bool:
-        from agent_bus.db import AgentORM
-
-        with self._sess() as sess:
-            agent = sess.get(AgentORM, agent_id)
-            return agent is not None and agent.token == token
+        doc = self._agents.find_one({"agent_id": agent_id, "token": token})
+        return doc is not None
 
     def agent_id_from_token(self, token: str) -> Optional[str]:
-        from agent_bus.db import AgentORM
-        from sqlalchemy import select
-
-        with self._sess() as sess:
-            stmt = select(AgentORM).where(AgentORM.token == token)
-            agent = sess.execute(stmt).scalar_one_or_none()
-            return agent.agent_id if agent else None
+        doc = self._agents.find_one({"token": token})
+        return doc["agent_id"] if doc else None
 
     def unregister_agent(self, agent_id: str) -> bool:
-        from agent_bus.db import AgentORM, MessageORM, GroupORM
-
-        with self._sess() as sess:
-            agent = sess.get(AgentORM, agent_id)
-            if not agent:
-                return False
-            # remove from groups
-            for group in sess.query(GroupORM).all():
-                group.members = [m for m in group.members if m.agent_id != agent_id]
-            # delete messages
-            sess.query(MessageORM).filter(
-                (MessageORM.to_agent_id == agent_id) | (MessageORM.from_agent == agent_id)
-            ).delete(synchronize_session=False)
-            sess.delete(agent)
-            sess.commit()
-            return True
+        result = self._agents.delete_one({"agent_id": agent_id})
+        if result.deleted_count == 0:
+            return False
+        self._messages.delete_many({"to_agent_id": agent_id})
+        self._messages.delete_many({"from_agent": agent_id})
+        self._groups.update_many({}, {"$pull": {"members": agent_id}})
+        return True
 
     def touch_agent(self, agent_id: str) -> None:
-        from agent_bus.db import AgentORM
-
-        with self._sess() as sess:
-            agent = sess.get(AgentORM, agent_id)
-            if agent:
-                agent.last_seen = datetime.now(timezone.utc)
-                sess.commit()
+        self._agents.update_one(
+            {"agent_id": agent_id},
+            {"$set": {"last_seen": datetime.now(timezone.utc)}}
+        )
 
     def add_message(self, msg: Message) -> None:
-        from agent_bus.db import AgentORM, MessageORM, GroupORM
-        from sqlalchemy import select
-
-        with self._sess() as sess:
-            delivered = datetime.now(timezone.utc)
-            if msg.to.startswith("agent_"):
-                agent = sess.get(AgentORM, msg.to)
-                if agent:
-                    m = MessageORM(
-                        msg_id=msg.msg_id,
-                        msg_type=msg.msg_type,
-                        from_agent=msg.from_agent,
-                        to=msg.to,
-                        to_agent_id=msg.to,
-                        content_summary=msg.content.summary,
-                        content_detail=self._json_safe(msg.content.detail),
-                        require_human_confirm=msg.require_human_confirm,
-                        human_confirmed=msg.human_confirmed,
-                        delivered_at=delivered,
-                        timestamp=msg.timestamp,
-                    )
-                    sess.add(m)
-                    sess.commit()
-            elif msg.to.startswith("group_"):
-                group = sess.get(GroupORM, msg.to)
-                if group:
-                    for member in group.members:
-                        m = MessageORM(
-                            msg_id=f"{msg.msg_id}_{member.agent_id}",
-                            msg_type=msg.msg_type,
-                            from_agent=msg.from_agent,
-                            to=msg.to,
-                            to_agent_id=member.agent_id,
-                            content_summary=msg.content.summary,
-                            content_detail=self._json_safe(msg.content.detail),
-                            require_human_confirm=msg.require_human_confirm,
-                            human_confirmed=msg.human_confirmed,
-                            delivered_at=delivered,
-                            timestamp=msg.timestamp,
-                        )
-                        sess.add(m)
-                    sess.commit()
+        delivered = datetime.now(timezone.utc)
+        base_doc = {
+            "msg_id": msg.msg_id,
+            "msg_type": msg.msg_type,
+            "from_agent": msg.from_agent,
+            "to": msg.to,
+            "content_summary": msg.content.summary,
+            "content_detail": msg.content.detail,
+            "require_human_confirm": msg.require_human_confirm,
+            "human_confirmed": msg.human_confirmed,
+            "read_at": None,
+            "delivered_at": delivered,
+            "timestamp": msg.timestamp,
+        }
+        if msg.to.startswith("agent_"):
+            doc = {**base_doc, "to_agent_id": msg.to}
+            self._messages.insert_one(doc)
+        elif msg.to.startswith("group_"):
+            group = self._groups.find_one({"group_id": msg.to})
+            if group:
+                docs = []
+                for member_id in group.get("members", []):
+                    docs.append({**base_doc, "msg_id": f"{msg.msg_id}_{member_id}", "to_agent_id": member_id})
+                if docs:
+                    self._messages.insert_many(docs)
 
     def get_inbox(self, agent_id: str, since: Optional[datetime] = None, unread_only: bool = False) -> List[Message]:
-        from agent_bus.db import MessageORM
-        from sqlalchemy import select, and_
-
-        with self._sess() as sess:
-            stmt = select(MessageORM).where(MessageORM.to_agent_id == agent_id)
-            if since is not None:
-                stmt = stmt.where(MessageORM.timestamp > since)
-            if unread_only:
-                stmt = stmt.where(MessageORM.read_at.is_(None))
-            stmt = stmt.order_by(MessageORM.timestamp)
-            msgs = sess.execute(stmt).scalars().all()
-            return [self._to_msg(m) for m in msgs]
+        query: dict = {"to_agent_id": agent_id}
+        if since is not None:
+            query["timestamp"] = {"$gt": since}
+        if unread_only:
+            query["read_at"] = None
+        docs = self._messages.find(query).sort("timestamp", 1)
+        return [self._msg_from_doc(d) for d in docs]
 
     def get_message(self, agent_id: str, msg_id: str) -> Optional[Message]:
-        from agent_bus.db import MessageORM
-
-        with self._sess() as sess:
-            # For group messages, the stored msg_id may have _{agent_id} suffix
-            m = sess.get(MessageORM, msg_id)
-            if m and m.to_agent_id == agent_id:
-                return self._to_msg(m)
-            # Try the suffixed version
-            m2 = sess.get(MessageORM, f"{msg_id}_{agent_id}")
-            if m2 and m2.to_agent_id == agent_id:
-                return self._to_msg(m2)
-            return None
+        doc = self._messages.find_one({"msg_id": msg_id, "to_agent_id": agent_id})
+        if doc:
+            return self._msg_from_doc(doc)
+        doc = self._messages.find_one({"msg_id": f"{msg_id}_{agent_id}", "to_agent_id": agent_id})
+        if doc:
+            return self._msg_from_doc(doc)
+        return None
 
     def mark_read(self, agent_id: str, msg_id: str) -> bool:
-        from agent_bus.db import MessageORM
-
-        with self._sess() as sess:
-            m = sess.get(MessageORM, msg_id)
-            if m and m.to_agent_id == agent_id:
-                m.read_at = datetime.now(timezone.utc)
-                sess.commit()
-                return True
-            return False
+        result = self._messages.update_one(
+            {"msg_id": msg_id, "to_agent_id": agent_id},
+            {"$set": {"read_at": datetime.now(timezone.utc)}}
+        )
+        return result.modified_count > 0
 
     def mark_all_read(self, agent_id: str) -> int:
-        from agent_bus.db import MessageORM
-        from sqlalchemy import update
-
-        with self._sess() as sess:
-            now = datetime.now(timezone.utc)
-            result = sess.execute(
-                update(MessageORM)
-                .where(
-                    MessageORM.to_agent_id == agent_id,
-                    MessageORM.read_at.is_(None),
-                )
-                .values(read_at=now)
-            )
-            sess.commit()
-            return result.rowcount
+        result = self._messages.update_many(
+            {"to_agent_id": agent_id, "read_at": None},
+            {"$set": {"read_at": datetime.now(timezone.utc)}}
+        )
+        return result.modified_count
 
     def create_group(self, name: str, created_by: str) -> Group:
-        from agent_bus.db import AgentORM, GroupORM
-
-        group_id = f"group_{int(time.time())}_{secrets.token_hex(4)}"
-        with self._sess() as sess:
-            creator = sess.get(AgentORM, created_by)
-            group = GroupORM(group_id=group_id, name=name, created_by=created_by)
-            if creator:
-                group.members.append(creator)
-            sess.add(group)
-            sess.commit()
-            sess.refresh(group)
-            return self._to_group(group)
+        group_id = self._next_id("group")
+        now = datetime.now(timezone.utc)
+        doc = {
+            "group_id": group_id,
+            "name": name,
+            "created_by": created_by,
+            "created_at": now,
+            "members": [created_by],
+        }
+        self._groups.insert_one(doc)
+        return self._group_from_doc(doc)
 
     def get_group(self, group_id: str) -> Optional[Group]:
-        from agent_bus.db import GroupORM
-
-        with self._sess() as sess:
-            group = sess.get(GroupORM, group_id)
-            return self._to_group(group) if group else None
+        doc = self._groups.find_one({"group_id": group_id})
+        return self._group_from_doc(doc) if doc else None
 
     def list_groups(self) -> List[Group]:
-        from agent_bus.db import GroupORM
-        from sqlalchemy import select
-
-        with self._sess() as sess:
-            stmt = select(GroupORM)
-            groups = sess.execute(stmt).scalars().all()
-            return [self._to_group(g) for g in groups]
+        docs = self._groups.find()
+        return [self._group_from_doc(d) for d in docs]
 
     def join_group(self, group_id: str, agent_id: str) -> bool:
-        from agent_bus.db import AgentORM, GroupORM
-
-        with self._sess() as sess:
-            group = sess.get(GroupORM, group_id)
-            agent = sess.get(AgentORM, agent_id)
-            if not group or not agent:
-                return False
-            if agent in group.members:
-                return False
-            group.members.append(agent)
-            sess.commit()
-            return True
+        result = self._groups.update_one(
+            {"group_id": group_id},
+            {"$addToSet": {"members": agent_id}}
+        )
+        return result.modified_count > 0
 
     def leave_group(self, group_id: str, agent_id: str) -> bool:
-        from agent_bus.db import AgentORM, GroupORM
+        result = self._groups.update_one(
+            {"group_id": group_id},
+            {"$pull": {"members": agent_id}}
+        )
+        return result.modified_count > 0
 
-        with self._sess() as sess:
-            group = sess.get(GroupORM, group_id)
-            agent = sess.get(AgentORM, agent_id)
-            if not group or not agent:
-                return False
-            if agent not in group.members:
-                return False
-            group.members.remove(agent)
-            sess.commit()
-            return True
+    # ---------- Admin helpers ----------
 
-
-# Admin helpers (not part of BaseStore)
     def admin_list_messages(self, from_agent: Optional[str] = None, to: Optional[str] = None,
                             since: Optional[datetime] = None, msg_type: Optional[str] = None) -> List[Message]:
-        from agent_bus.db import MessageORM
-        from sqlalchemy import select
-
-        with self._sess() as sess:
-            stmt = select(MessageORM)
-            if from_agent:
-                stmt = stmt.where(MessageORM.from_agent == from_agent)
-            if to:
-                stmt = stmt.where(MessageORM.to == to)
-            if since:
-                stmt = stmt.where(MessageORM.timestamp > since)
-            if msg_type:
-                stmt = stmt.where(MessageORM.msg_type == msg_type)
-            stmt = stmt.order_by(MessageORM.timestamp.desc())
-            msgs = sess.execute(stmt).scalars().all()
-            return [self._to_msg(m) for m in msgs]
+        query: dict = {}
+        if from_agent:
+            query["from_agent"] = from_agent
+        if to:
+            query["to"] = to
+        if since:
+            query["timestamp"] = {"$gt": since}
+        if msg_type:
+            query["msg_type"] = msg_type
+        docs = self._messages.find(query).sort("timestamp", -1)
+        return [self._msg_from_doc(d) for d in docs]
 
     def admin_get_stats(self) -> dict:
-        from agent_bus.db import AgentORM, MessageORM
-        from sqlalchemy import func, select
+        from bson import CodecOptions
 
-        with self._sess() as sess:
-            total_agents = sess.execute(select(func.count()).select_from(AgentORM)).scalar()
-            online_agents = sess.execute(
-                select(func.count()).select_from(AgentORM).where(AgentORM.online == True)
-            ).scalar()
-            total_messages = sess.execute(select(func.count()).select_from(MessageORM)).scalar()
-            unread_messages = sess.execute(
-                select(func.count()).select_from(MessageORM).where(MessageORM.read_at.is_(None))
-            ).scalar()
-            today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-            messages_today = sess.execute(
-                select(func.count()).select_from(MessageORM).where(MessageORM.timestamp >= today)
-            ).scalar()
-            # avg read latency in ms for messages that have been read
-            avg_latency = sess.execute(
-                select(func.avg(func.julianday(MessageORM.read_at) - func.julianday(MessageORM.delivered_at)) * 86400 * 1000)
-                .where(MessageORM.read_at.isnot(None))
-            ).scalar()
-            return {
-                "total_agents": total_agents or 0,
-                "online_agents": online_agents or 0,
-                "total_messages": total_messages or 0,
-                "unread_messages": unread_messages or 0,
-                "messages_today": messages_today or 0,
-                "avg_read_latency_ms": round(avg_latency, 2) if avg_latency else 0,
-            }
+        total_agents = self._agents.count_documents({})
+        online_agents = self._agents.count_documents({"online": True})
+        total_messages = self._messages.count_documents({})
+        unread_messages = self._messages.count_documents({"read_at": None})
+        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        messages_today = self._messages.count_documents({"timestamp": {"$gte": today}})
+
+        # avg latency for read messages (ms)
+        pipeline = [
+            {"$match": {"read_at": {"$ne": None}}},
+            {"$project": {"latency": {"$subtract": [{"$toLong": "$read_at"}, {"$toLong": "$delivered_at"}]}}},
+            {"$group": {"_id": None, "avg_latency": {"$avg": "$latency"}}},
+        ]
+        result = list(self._messages.aggregate(pipeline))
+        avg_latency_ms = result[0]["avg_latency"] if result else 0
+
+        return {
+            "total_agents": total_agents,
+            "online_agents": online_agents,
+            "total_messages": total_messages,
+            "unread_messages": unread_messages,
+            "messages_today": messages_today,
+            "avg_read_latency_ms": round(avg_latency_ms, 2) if avg_latency_ms else 0,
+        }
 
     def admin_update_agent_labels(self, agent_id: str, labels: List[str]) -> bool:
-        from agent_bus.db import AgentORM
-
-        with self._sess() as sess:
-            agent = sess.get(AgentORM, agent_id)
-            if not agent:
-                return False
-            agent.labels = labels
-            sess.commit()
-            return True
+        result = self._agents.update_one(
+            {"agent_id": agent_id},
+            {"$set": {"labels": labels}}
+        )
+        return result.modified_count > 0
 
 
 def get_store() -> BaseStore:
-    """Factory: SQLiteStore if DATABASE_URL is set, RedisStore if REDIS_URL is set, otherwise MemoryStore."""
-    from agent_bus.db import SessionLocal, create_tables
-
-    db_url = os.getenv("DATABASE_URL")
-    if db_url:
-        create_tables()
-        return SQLiteStore(SessionLocal)
+    """Factory: MongoStore if MONGODB_URL is set, RedisStore if REDIS_URL is set, otherwise MemoryStore."""
+    mongo_url = os.getenv("MONGODB_URL")
+    if mongo_url:
+        return MongoStore(mongo_url)
     redis_url = os.getenv("REDIS_URL")
     if redis_url:
         return RedisStore(redis_url)
