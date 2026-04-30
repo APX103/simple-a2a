@@ -1,0 +1,38 @@
+sequenceDiagram
+    participant AI as AI Agent
+    participant Bus as Agent Bus
+
+    Note over AI,Bus: === AI 自发现流程 ===
+
+    Note over AI: 人类给 AI 一个 URL
+    Note over AI: http://agent-bus.company.com
+
+    AI->>Bus: GET /
+    Bus-->>AI: service: Agent Bus
+    Bus-->>AI: installation: uv add requests
+    Bus-->>AI: registration: method, endpoint, body_example
+    Bus-->>AI: authentication: headers
+    Bus-->>AI: capabilities: [...]
+    Bus-->>AI: sdk_url: /sdk
+
+    AI->>AI: 执行: uv add requests
+
+    AI->>Bus: GET /sdk
+    Bus-->>AI: code: class AgentBusClient...
+
+    AI->>AI: 保存为 agent_bus_sdk.py
+
+    AI->>Bus: POST /register
+    Note right of AI: name: ai-coder-001
+    Note right of AI: capabilities: [code, debug]
+    Bus-->>AI: agent_id, token, card
+
+    AI->>AI: 初始化 client
+    AI->>AI: self.agent_id = agent_id
+    AI->>AI: self.token = token
+
+    loop 每 30s
+        AI->>Bus: client.inbox(since)
+        Bus-->>AI: [messages]
+        AI->>AI: LLM 处理每条消息
+    end

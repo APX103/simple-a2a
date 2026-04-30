@@ -1,0 +1,78 @@
+digraph AgentBusArchitecture {
+  rankdir=TB;
+  node [shape=box, style="rounded,filled", fontname="Helvetica"];
+  edge [fontname="Helvetica", fontsize=10];
+
+  subgraph cluster_external {
+    label="外部世界";
+    style=dashed;
+    color=gray;
+    
+    user [label="人类用户\n(Web/UI)", fillcolor="#e1f5fe"];
+    claude [label="Claude Code", fillcolor="#fff3e0"];
+    kimi [label="Kimi Code", fillcolor="#fff3e0"];
+    other [label="其他 AI Agent", fillcolor="#fff3e0"];
+    mcp [label="外部服务\n(MCP Server)", fillcolor="#f3e5f5"];
+  }
+
+  subgraph cluster_bus {
+    label="Agent Bus (HTTP 服务)";
+    style=filled;
+    color=lightblue;
+    fillcolor="#e3f2fd";
+    
+    api [label="API 路由\n/v1/switchboard", shape=ellipse, fillcolor="#bbdefb"];
+    
+    register [label="注册中心\n/register", fillcolor="#90caf9"];
+    send [label="消息总线\n/send", fillcolor="#90caf9"];
+    inbox [label="轮询收件箱\n/inbox", fillcolor="#90caf9"];
+    groups [label="群组管理\n/groups", fillcolor="#90caf9"];
+    agents [label="Agent 发现\n/agents", fillcolor="#90caf9"];
+    sdk [label="SDK 下载\n/sdk", fillcolor="#90caf9"];
+    manifest [label="自描述\n/", fillcolor="#90caf9"];
+    
+    api -> register;
+    api -> send;
+    api -> inbox;
+    api -> groups;
+    api -> agents;
+    api -> sdk;
+    api -> manifest;
+  }
+
+  subgraph cluster_store {
+    label="存储层";
+    style=filled;
+    color=lightgreen;
+    fillcolor="#e8f5e9";
+    
+    store [label="Store\n(内存/Redis)", shape=ellipse, fillcolor="#a5d6a7"];
+    
+    agents_store [label="Agents\n(Agent Card)", fillcolor="#c8e6c9"];
+    messages [label="Messages\n(Inbox 队列)", fillcolor="#c8e6c9"];
+    groups_store [label="Groups\n(成员列表)", fillcolor="#c8e6c9"];
+    tokens [label="Tokens\n(认证)", fillcolor="#c8e6c9"];
+    
+    store -> agents_store;
+    store -> messages;
+    store -> groups_store;
+    store -> tokens;
+  }
+
+  // 外部到 Bus
+  user -> api [label="HTTP", color="#1976d2", penwidth=2];
+  claude -> api [label="HTTP 轮询", color="#1976d2"];
+  kimi -> api [label="HTTP 轮询", color="#1976d2"];
+  other -> api [label="HTTP 轮询", color="#1976d2"];
+  
+  // Bus 到 Store
+  register -> store [label="读写", color="#388e3c"];
+  send -> store [label="写入", color="#388e3c"];
+  inbox -> store [label="读取", color="#388e3c"];
+  groups -> store [label="读写", color="#388e3c"];
+  agents -> store [label="读取", color="#388e3c"];
+  
+  // MCP 直接连接 (不经过 Bus)
+  claude -> mcp [label="MCP 协议\nSSE/stdio", style=dashed, color="#7b1fa2"];
+  kimi -> mcp [label="MCP 协议", style=dashed, color="#7b1fa2"];
+}

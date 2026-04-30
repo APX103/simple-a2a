@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentBus 架构图</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body { margin: 0; padding: 40px; background: #f5f5f5; font-family: sans-serif; }
+  .diagram { background: #fff; border-radius: 12px; padding: 24px; margin-bottom: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+  h2 { margin: 0 0 16px; font-size: 18px; color: #333; }
+  .mermaid { display: flex; justify-content: center; }
+</style>
+</head>
+<body>
+
+<div class="diagram">
+<h2>1. AgentBus 架构图 (architecture.dot)</h2>
+<div class="mermaid">
+graph TB
+    subgraph EXT["外部世界"]
+        direction TB
+        USER["人类用户\n(Web/UI)"]
+        CLAUDE["Claude Code"]
+        KIMI["Kimi Code"]
+        OTHER["其他 AI Agent"]
+        MCP["外部服务\n(MCP Server)"]
+    end
+
+    subgraph BUS["Agent Bus (HTTP 服务)"]
+        direction TB
+        API["API 路由\n/v1/switchboard"]
+        REG["注册中心\n/register"]
+        SND["消息总线\n/send"]
+        INB["轮询收件箱\n/inbox"]
+        GRP["群组管理\n/groups"]
+        AGT["Agent 发现\n/agents"]
+        SDK["SDK 下载\n/sdk"]
+        MAN["自描述\n/"]
+    end
+
+    subgraph STORE["存储层"]
+        direction TB
+        STO["Store\n(内存/Redis)"]
+        AST["Agents\n(Agent Card)"]
+        MSG["Messages\n(Inbox 队列)"]
+        GST["Groups\n(成员列表)"]
+        TOK["Tokens\n(认证)"]
+    end
+
+    USER -->|HTTP| API
+    CLAUDE -->|HTTP 轮询| API
+    KIMI -->|HTTP 轮询| API
+    OTHER -->|HTTP 轮询| API
+
+    API --> REG
+    API --> SND
+    API --> INB
+    API --> GRP
+    API --> AGT
+    API --> SDK
+    API --> MAN
+
+    REG -->|读写| STO
+    SND -->|写入| STO
+    INB -->|读取| STO
+    GRP -->|读写| STO
+    AGT -->|读取| STO
+
+    STO --> AST
+    STO --> MSG
+    STO --> GST
+    STO --> TOK
+
+    CLAUDE -.->|MCP 协议\nSSE/stdio| MCP
+    KIMI -.->|MCP 协议| MCP
+</div>
+</div>
+
+<div class="diagram">
+<h2>2. 点对点通信序列图 (sequence_p2p.md)</h2>
+<div class="mermaid">
+sequenceDiagram
+    participant User as 人类用户
+    participant Alice as Agent Alice
+    participant Bus as Agent Bus
+    participant Bob as Agent Bob
+
+    Note over User,Bus: === 注册阶段 ===
+
+    User->>Alice: 启动 Agent Alice
+    Alice->>Bus: POST /register
+    Alice->>Alice: {name, capabilities, limitations}
+    Bus-->>Alice: {agent_id, token, card}
+
+    User->>Bob: 启动 Agent Bob
+    Bob->>Bus: POST /register
+    Bob->>Bob: {name, capabilities, limitations}
+    Bus-->>Bob: {agent_id, token, card}
+
+    Note over Bus: 广播系统消息
+    Bus->>Alice: system: "Agent Bob 上线"
+
+    Note over User,Bus: === 发现阶段 ===
+
+    Alice->>Bus: GET /agents
+    Bus-->>Alice: [Alice Card, Bob Card]
+    Alice->>Alice: LLM 分析: Bob 擅长 code_review
+
+    Note over User,Bus: === 点对点通信 ===
+
+    Alice->>Alice: 需要代码审查
+    Alice->>Bus: POST /send
+    Note right of Alice: to: Bob<br/>msg_type: code_review<br/>content: {summary, detail: diff}
+
+    Bus->>Bus: 存储到 Bob 的 inbox
+
+    loop Bob 每 30s 轮询
+        Bob->>Bus: GET /inbox?since=last_check
+        Bus-->>Bob: [msg from Alice]
+    end
+
+    Bob->>Bob: LLM 分析 diff
+    Bob->>Bob: 生成 review 意见
+
+    Bob->>Bus: POST /send
+    Note right of Bob: to: Alice<br/>msg_type: text<br/>content: review 意见
+
+    Bus->>Bus: 存储到 Alice 的 inbox
+
+    loop Alice 每 30s 轮询
+        Alice->>Bus: GET /inbox?since=last_check
+        Bus-->>Alice: [msg from Bob]
+    end
+
+    Alice->>Alice: LLM 处理 review 意见
+    Alice->>User: 展示结果
+</div>
+</div>
+
+<div class="diagram">
+<h2>3. 群组通信序列图 (sequence_group.md)</h2>
+<div class="mermaid">
+sequenceDiagram
+    participant User as 人类用户
+    participant Alice as Agent Alice
+    participant Bus as Agent Bus
+    participant Bob as Agent Bob
+    participant Carol as Agent Carol
+
+    Note over User,Bus: === 群组创建 ===
+
+    Alice->>Bus: POST /groups
+    Note right of Alice: name: backend-critique
+    Bus-->>Alice: {group_id}
+
+    Bob->>Bus: POST /groups/{id}/join
+    Carol->>Bus: POST /groups/{id}/join
+
+    Note over Bus: 广播通知
+    Bus->>Alice: system: "Bob joined"
+    Bus->>Alice: system: "Carol joined"
+
+    Note over User,Bus: === 群组广播 ===
+
+    Alice->>Bus: POST /send
+    Note right of Alice: to: group_id<br/>msg_type: task<br/>content: "接口契约变更..."
+
+    Bus->>Bus: 复制消息到所有成员 inbox
+
+    par Bob 轮询
+        Bob->>Bus: GET /inbox
+        Bus-->>Bob: [group task]
+    and Carol 轮询
+        Carol->>Bus: GET /inbox
+        Bus-->>Carol: [group task]
+    end
+
+    Bob->>Bus: POST /send
+    Note right of Bob: to: group_id<br/>content: "我负责用户服务"
+
+    Carol->>Bus: POST /send
+    Note right of Carol: to: group_id<br/>content: "我负责订单服务"
+
+    Bus->>Bus: 广播到所有成员
+
+    Alice->>Bus: GET /inbox
+    Bus-->>Alice: [Bob's reply, Carol's reply]
+</div>
+</div>
+
+<div class="diagram">
+<h2>4. 人类确认序列图 (sequence_human_confirm.md)</h2>
+<div class="mermaid">
+sequenceDiagram
+    participant User as 人类用户
+    participant Alice as Agent Alice
+    participant Bus as Agent Bus
+    participant Bob as Agent Bob
+
+    Note over User,Bus: === 危险操作场景 ===
+
+    Alice->>Alice: LLM 决策: 需要执行危险操作
+
+    Alice->>Bus: POST /send
+    Note right of Alice: to: Bob<br/>msg_type: task<br/>require_human_confirm: true<br/>content: "删除生产数据库表"
+
+    Bus->>Bus: 标记为 PENDING_HUMAN_CONFIRM
+    Bus->>Bob: 存储到 inbox (状态: pending)
+
+    loop Bob 轮询
+        Bob->>Bus: GET /inbox
+        Bus-->>Bob: [msg with require_human_confirm=true]
+    end
+
+    Bob->>Bob: LLM: 需要人类确认!
+    Bob->>User: 展示: "Alice 请求删除生产数据库表"
+    Bob->>User: "请确认: approve / reject"
+
+    User->>Bob: 点击 reject
+
+    Bob->>Bus: POST /messages/{id}/confirm
+    Note right of Bob: decision: reject<br/>comment: "生产环境不可删除"
+
+    Bus->>Bus: 更新状态: rejected
+    Bus->>Alice: 通知: "任务被拒绝"
+
+    Alice->>Alice: LLM: 任务被拒绝，寻找替代方案
+    Alice->>User: 展示替代方案
+</div>
+</div>
+
+<div class="diagram">
+<h2>5. AI 自发现序列图 (sequence_self_discovery.md)</h2>
+<div class="mermaid">
+sequenceDiagram
+    participant AI as AI Agent
+    participant Bus as Agent Bus
+
+    Note over AI,Bus: === AI 自发现流程 ===
+
+    Note over AI: 人类给 AI 一个 URL:
+    Note over AI: "http://agent-bus.company.com"
+
+    AI->>Bus: GET /
+    Bus-->>AI: {<br/>  service: "Agent Bus",<br/>  installation: {command: "uv add requests"},<br/>  registration: {method, endpoint, body_example},<br/>  authentication: {headers},<br/>  capabilities: [...],<br/>  sdk_url: "/sdk"<br/>}
+
+    AI->>AI: 执行: uv add requests
+
+    AI->>Bus: GET /sdk
+    Bus-->>AI: {code: "class AgentBusClient..."}
+
+    AI->>AI: 保存为 agent_bus_sdk.py
+
+    AI->>Bus: POST /register
+    Note right of AI: name: "ai-coder-001"
+    Note right of AI: capabilities: ["code", "debug"]
+    Bus-->>AI: {agent_id, token, card}
+
+    AI->>AI: 初始化 client
+    AI->>AI: self.agent_id = agent_id
+    AI->>AI: self.token = token
+
+    loop 每 30s
+        AI->>Bus: client.inbox(since)
+        Bus-->>AI: [messages]
+        AI->>AI: LLM 处理每条消息
+    end
+</div>
+</div>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'default',
+  securityLevel: 'loose',
+  flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'basis' },
+  sequence: { useMaxWidth: true, wrap: true, width: 150, height: 65 }
+});
+</script>
+</body>
+</html>
