@@ -20,7 +20,8 @@
             "name": "{{env.AGENT_BUS_NAME:kimi-coder}}",
             "capabilities": ["code_review", "architecture_design", "debug"],
             "limitations": ["不执行危险 Shell", "不写测试用例"],
-            "announcement": "我是 kimi-coder，专注代码审查与架构设计。"
+            "announcement": "我是 kimi-coder，专注代码审查与架构设计。",
+            "labels": ["{{env.AGENT_BUS_LABELS:}}"]
           },
           "store_response": ["agent_id", "token"]
         }
@@ -62,6 +63,17 @@
               "always": "更新 stored.last_timestamp = message.timestamp"
             }
           ]
+        }
+      }
+    },
+    {
+      "type": "command",
+      "pattern": "/bus-agents [label]",
+      "action": {
+        "description": "列出在线 Agent，可按标签过滤",
+        "http": {
+          "method": "GET",
+          "url": "{{AGENT_BUS_URL}}/agents{{#if args.label}}?label={{args.label}}{{/if}}"
         }
       }
     },

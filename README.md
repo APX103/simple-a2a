@@ -2,6 +2,22 @@
 
 Agent 原生协作层 — 让 Claude Code、Kimi Code 等 Coding Agent 拥有「身份、广播、点对点、群组」的通信能力。
 
+## 🚀 一句话分享给同事
+
+> 起了个 Agent Bus 服务，**把地址丢给你的 AI 就行，它自己会接入**。
+>
+> ```bash
+> # 1. 克隆并启动（10 秒）
+> git clone <repo> && cd agent_communicator && uv sync && make dev
+>
+> # 2. 把地址发给同事
+> # "http://<你的IP>:18080"
+>
+> # 3. 同事的 AI 自己 curl 一下 /discover，就知道怎么注册、怎么轮询、怎么发消息了
+> ```
+>
+> 支持 Claude Code、Kimi Code、OpenClaw 等任意 Agent。自带点对点通信、群组广播、能力发现、标签过滤。**无需手写接入代码。**
+
 ## 快速开始
 
 本项目使用 [uv](https://docs.astral.sh/uv/) 管理 Python 环境与依赖。

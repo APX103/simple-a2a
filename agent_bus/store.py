@@ -17,7 +17,7 @@ class BaseStore(ABC):
 
     @abstractmethod
     def register_agent(
-        self, name: str, capabilities: List[str], limitations: List[str], announcement: str
+        self, name: str, capabilities: List[str], limitations: List[str], announcement: str, labels: List[str] = None
     ) -> tuple[str, str, AgentCard]:
         ...
 
@@ -26,7 +26,7 @@ class BaseStore(ABC):
         ...
 
     @abstractmethod
-    def list_agents(self) -> List[AgentCard]:
+    def list_agents(self, label: Optional[str] = None) -> List[AgentCard]:
         ...
 
     @abstractmethod
@@ -96,7 +96,7 @@ class MemoryStore(BaseStore):
         return f"{prefix}_{ts}_{rand}_{self._counter}"
 
     def register_agent(
-        self, name: str, capabilities: List[str], limitations: List[str], announcement: str
+        self, name: str, capabilities: List[str], limitations: List[str], announcement: str, labels: List[str] = None
     ) -> tuple[str, str, AgentCard]:
         with self._lock:
             agent_id = self._next_id("agent")
@@ -107,6 +107,7 @@ class MemoryStore(BaseStore):
                 capabilities=capabilities,
                 limitations=limitations,
                 announcement=announcement,
+                labels=labels or [],
             )
             self._agents[agent_id] = card
             self._tokens[agent_id] = token
@@ -117,9 +118,12 @@ class MemoryStore(BaseStore):
         with self._lock:
             return self._agents.get(agent_id)
 
-    def list_agents(self) -> List[AgentCard]:
+    def list_agents(self, label: Optional[str] = None) -> List[AgentCard]:
         with self._lock:
-            return list(self._agents.values())
+            agents = list(self._agents.values())
+            if label:
+                agents = [a for a in agents if label in a.labels]
+            return agents
 
     def verify_token(self, agent_id: str, token: str) -> bool:
         with self._lock:
@@ -226,7 +230,7 @@ class RedisStore(BaseStore):
         return f"{prefix}_{ts}_{rand}_{counter}"
 
     def register_agent(
-        self, name: str, capabilities: List[str], limitations: List[str], announcement: str
+        self, name: str, capabilities: List[str], limitations: List[str], announcement: str, labels: List[str] = None
     ) -> tuple[str, str, AgentCard]:
         agent_id = self._next_id("agent")
         token = secrets.token_urlsafe(32)
@@ -236,6 +240,7 @@ class RedisStore(BaseStore):
             capabilities=capabilities,
             limitations=limitations,
             announcement=announcement,
+            labels=labels or [],
         )
         pipe = self._client.pipeline()
         pipe.hset(self._key("agents"), agent_id, card.model_dump_json())
@@ -250,9 +255,12 @@ class RedisStore(BaseStore):
             return None
         return AgentCard.model_validate_json(raw)
 
-    def list_agents(self) -> List[AgentCard]:
+    def list_agents(self, label: Optional[str] = None) -> List[AgentCard]:
         raw_map = self._client.hgetall(self._key("agents"))
-        return [AgentCard.model_validate_json(v) for v in raw_map.values()]
+        agents = [AgentCard.model_validate_json(v) for v in raw_map.values()]
+        if label:
+            agents = [a for a in agents if label in a.labels]
+        return agents
 
     def verify_token(self, agent_id: str, token: str) -> bool:
         return self._client.hget(self._key("tokens"), agent_id) == token

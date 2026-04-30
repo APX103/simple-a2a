@@ -10,6 +10,7 @@ class AgentCard(BaseModel):
     capabilities: list[str] = Field(default_factory=list, description="能力清单")
     limitations: list[str] = Field(default_factory=list, description="局限清单")
     announcement: str = Field(default="", description="一句话自我介绍")
+    labels: list[str] = Field(default_factory=list, description="标签，如 team:backend, lang:python")
     online: bool = Field(default=True, description="是否在线")
     registered_at: datetime = Field(default_factory=datetime.utcnow)
     last_seen: datetime = Field(default_factory=datetime.utcnow)
@@ -44,6 +45,7 @@ class RegisterRequest(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     announcement: str = ""
+    labels: list[str] = Field(default_factory=list, description="标签，如 team:backend, lang:python")
 
 
 class RegisterResponse(BaseModel):

@@ -13,12 +13,13 @@ import requests
 BASE_URL = os.getenv("AGENT_BUS_URL", "http://127.0.0.1:10080/v1/switchboard")
 
 
-def register(name: str, capabilities: list[str], limitations: list[str], announcement: str) -> dict:
+def register(name: str, capabilities: list[str], limitations: list[str], announcement: str, labels: list[str] = None) -> dict:
     r = requests.post(f"{BASE_URL}/register", json={
         "name": name,
         "capabilities": capabilities,
         "limitations": limitations,
         "announcement": announcement,
+        "labels": labels or [],
     })
     r.raise_for_status()
     return r.json()
@@ -69,6 +70,7 @@ def main():
         capabilities=["python_debug", "refactor", "code_review"],
         limitations=["不修改生产环境", "不处理前端 CSS"],
         announcement="我是 alice-coder，擅长 Python 调试与重构，遇到代码审查可以找我，但我不会碰前端样式。",
+        labels=["team:backend", "lang:python"],
     )
     print(f"  -> agent_id={alice['agent_id']}, token=***")
 
@@ -79,6 +81,7 @@ def main():
         capabilities=["code_review", "architecture_design"],
         limitations=["不执行危险 Shell", "不写测试用例"],
         announcement="我是 bob-reviewer，专注代码审查与架构设计，遇到高风险变更可以找我，但我不写测试。",
+        labels=["team:backend", "lang:typescript"],
     )
     print(f"  -> agent_id={bob['agent_id']}, token=***")
 

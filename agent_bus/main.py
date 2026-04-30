@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
@@ -19,6 +20,52 @@ from agent_bus.models import (
     SendResponse,
 )
 from agent_bus.store import store
+
+# ---------- Skill discovery — auto-generated from examples/ ----------
+
+_EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
+
+
+def _load_skill_text(filename: str) -> str:
+    path = _EXAMPLES_DIR / filename
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return f"# Skill file not found: {filename}\n"
+
+
+_SKILL_DISCOVERY = {
+    "service": "Agent Bus",
+    "version": "1.0.0",
+    "instruction": (
+        "你是一个 AI Agent，需要将你自己接入 Agent Bus 协作网络，以便与其他 Agent 点对点通信、群组广播和能力发现。"
+        "步骤如下：\n"
+        "1. 根据你的客户端类型（kimi_code / claude_code / openclaw），从 skills 字段取出对应的 skill 配置字符串。\n"
+        "2. 将 skill 配置保存到你客户端约定的 skill 目录（如 .kimi/skills/、.claude/skills/ 或 skills/agent-bus/）。\n"
+        "3. 配置环境变量 AGENT_BUS_URL（必填）、AGENT_BUS_NAME（可选）、AGENT_BUS_LABELS（可选）。\n"
+        "4. 按 skill 配置中的指引注册到 Agent Bus，并启动定时轮询收件箱。\n"
+        "5. 开始与其他 Agent 协作。"
+    ),
+    "env": {
+        "AGENT_BUS_URL": "Agent Bus 服务地址，例如 http://127.0.0.1:10080/v1/switchboard",
+        "AGENT_BUS_NAME": "本 Agent 的标识名称，例如 my-coder",
+        "AGENT_BUS_LABELS": "标签，逗号分隔，例如 team:backend,lang:python",
+    },
+    "endpoints": {
+        "register": {"method": "POST", "path": "/v1/switchboard/register", "description": "注册获取 agent_id 和 token"},
+        "send": {"method": "POST", "path": "/v1/switchboard/send", "description": "点对点或群组发消息"},
+        "inbox": {"method": "GET", "path": "/v1/switchboard/inbox", "description": "轮询收件箱，支持 since 增量"},
+        "agents": {"method": "GET", "path": "/v1/switchboard/agents", "description": "发现在线 Agent，支持 ?label= 过滤"},
+        "groups": {"method": "POST/GET", "path": "/v1/switchboard/groups", "description": "创建/管理群组"},
+        "confirm": {"method": "POST", "path": "/v1/switchboard/messages/{msg_id}/confirm", "description": "人类确认消息"},
+        "discover": {"method": "GET", "path": "/v1/switchboard/discover", "description": "本接口 — 返回 skill 配置和接入指南"},
+    },
+    "skills": {
+        "kimi_code": _load_skill_text("kimi_code_skill.md"),
+        "claude_code": _load_skill_text("claude_code_skill.md"),
+        "openclaw": _load_skill_text("openclaw_code_skill.md"),
+    },
+}
 
 app = FastAPI(title="Agent Bus", version="1.0.0", description="Agent 原生协作层")
 
@@ -57,6 +104,7 @@ async def register(req: RegisterRequest):
         capabilities=req.capabilities,
         limitations=req.limitations,
         announcement=req.announcement,
+        labels=req.labels,
     )
     # broadcast system message to all other agents
     for other in store.list_agents():
@@ -73,8 +121,8 @@ async def register(req: RegisterRequest):
 
 
 @router.get("/agents", response_model=list[AgentCard])
-async def list_agents():
-    return store.list_agents()
+async def list_agents(label: Annotated[Optional[str], Query()] = None):
+    return store.list_agents(label=label)
 
 
 @router.get("/agents/{agent_id}", response_model=AgentCard)
@@ -225,12 +273,13 @@ class AgentBusClient:
         self.agent_id: Optional[str] = None
         self.token: Optional[str] = None
 
-    def register(self, name: str, capabilities: list[str], limitations: list[str], announcement: str) -> dict:
+    def register(self, name: str, capabilities: list[str], limitations: list[str], announcement: str, labels: list[str] = None) -> dict:
         r = requests.post(f"{self.base_url}/register", json={
             "name": name,
             "capabilities": capabilities,
             "limitations": limitations,
             "announcement": announcement,
+            "labels": labels or [],
         })
         r.raise_for_status()
         data = r.json()
@@ -258,8 +307,9 @@ class AgentBusClient:
         r.raise_for_status()
         return r.json()
 
-    def agents(self) -> list[dict]:
-        r = requests.get(f"{self.base_url}/agents")
+    def agents(self, label: str = None) -> list[dict]:
+        params = {"label": label} if label else None
+        r = requests.get(f"{self.base_url}/agents", params=params)
         r.raise_for_status()
         return r.json()
 
@@ -327,6 +377,12 @@ async def root():
 @app.get("/sdk")
 async def sdk():
     return {"filename": "agent_bus_sdk.py", "language": "python", "code": SDK_CODE}
+
+
+@router.get("/discover")
+async def discover():
+    """Agent 自发现接口 — 返回接入指南和可直接保存的 skill 配置。"""
+    return _SKILL_DISCOVERY
 
 
 @router.get("/health")

@@ -15,6 +15,7 @@ triggers:
       - capabilities: ["code_review", "refactor", "debug", "test"]
       - limitations: ["不修改生产环境", "不执行未经验证的 Shell"]
       - announcement: "我是 claude-coder，擅长代码审查与重构。"
+      - labels: 从环境变量 AGENT_BUS_LABELS 读取，逗号分隔，如 `team:backend,lang:python`
       将返回的 agent_id 和 token 存入内存，供后续请求使用。
 
   - schedule: every 30s
@@ -35,9 +36,9 @@ triggers:
     action: |
       调用 POST {{AGENT_BUS_URL}}/groups/<group_id>/join 加入群组。
 
-  - command: /bus-agents
+  - command: /bus-agents [label]
     action: |
-      调用 GET {{AGENT_BUS_URL}}/agents，列出所有在线 Agent 及其能力与边界，向人类汇报。
+      调用 GET {{AGENT_BUS_URL}}/agents{{#if label}}?label={{label}}{{/if}}，列出在线 Agent 及其能力与边界。若有 label 参数则按标签过滤，向人类汇报。
 ```
 
 **环境变量配置**（建议写入 `.env`）：
