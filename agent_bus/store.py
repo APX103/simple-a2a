@@ -50,11 +50,19 @@ class BaseStore(ABC):
         ...
 
     @abstractmethod
-    def get_inbox(self, agent_id: str, since: Optional[datetime] = None) -> List[Message]:
+    def get_inbox(self, agent_id: str, since: Optional[datetime] = None, unread_only: bool = False) -> List[Message]:
         ...
 
     @abstractmethod
     def get_message(self, agent_id: str, msg_id: str) -> Optional[Message]:
+        ...
+
+    @abstractmethod
+    def mark_read(self, agent_id: str, msg_id: str) -> bool:
+        ...
+
+    @abstractmethod
+    def mark_all_read(self, agent_id: str) -> int:
         ...
 
     @abstractmethod
@@ -165,12 +173,16 @@ class MemoryStore(BaseStore):
                         if member_id in self._messages:
                             self._messages[member_id].append(msg)
 
-    def get_inbox(self, agent_id: str, since: Optional[datetime] = None) -> List[Message]:
+    def get_inbox(self, agent_id: str, since: Optional[datetime] = None, unread_only: bool = False) -> List[Message]:
         with self._lock:
             msgs = self._messages.get(agent_id, [])
             if since is None:
-                return list(msgs)
-            return [m for m in msgs if m.timestamp > since]
+                result = list(msgs)
+            else:
+                result = [m for m in msgs if m.timestamp > since]
+            if unread_only:
+                result = [m for m in result if m.read_at is None]
+            return result
 
     def get_message(self, agent_id: str, msg_id: str) -> Optional[Message]:
         with self._lock:
@@ -178,6 +190,23 @@ class MemoryStore(BaseStore):
                 if m.msg_id == msg_id:
                     return m
             return None
+
+    def mark_read(self, agent_id: str, msg_id: str) -> bool:
+        with self._lock:
+            for m in self._messages.get(agent_id, []):
+                if m.msg_id == msg_id and m.read_at is None:
+                    m.read_at = datetime.utcnow()
+                    return True
+            return False
+
+    def mark_all_read(self, agent_id: str) -> int:
+        with self._lock:
+            count = 0
+            for m in self._messages.get(agent_id, []):
+                if m.read_at is None:
+                    m.read_at = datetime.utcnow()
+                    count += 1
+            return count
 
     def create_group(self, name: str, created_by: str) -> Group:
         with self._lock:
@@ -209,6 +238,73 @@ class MemoryStore(BaseStore):
                 group.members.remove(agent_id)
                 return True
             return False
+
+    def admin_list_messages(self, from_agent: Optional[str] = None, to: Optional[str] = None,
+                            since: Optional[datetime] = None, msg_type: Optional[str] = None) -> List[Message]:
+        with self._lock:
+            all_msgs: List[Message] = []
+            for msgs in self._messages.values():
+                all_msgs.extend(msgs)
+            # Deduplicate by msg_id (keep first occurrence)
+            seen = set()
+            result = []
+            for m in all_msgs:
+                if m.msg_id in seen:
+                    continue
+                seen.add(m.msg_id)
+                if from_agent and m.from_agent != from_agent:
+                    continue
+                if to and m.to != to:
+                    continue
+                if since and m.timestamp <= since:
+                    continue
+                if msg_type and m.msg_type != msg_type:
+                    continue
+                result.append(m)
+            result.sort(key=lambda x: x.timestamp, reverse=True)
+            return result
+
+    def admin_get_stats(self) -> dict:
+        with self._lock:
+            total_agents = len(self._agents)
+            online_agents = sum(1 for a in self._agents.values() if a.online)
+            # deduplicate messages by msg_id
+            seen = set()
+            total_messages = 0
+            unread_messages = 0
+            messages_today = 0
+            today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            latency_sum = 0.0
+            read_count = 0
+            for msgs in self._messages.values():
+                for m in msgs:
+                    if m.msg_id in seen:
+                        continue
+                    seen.add(m.msg_id)
+                    total_messages += 1
+                    if m.read_at is None:
+                        unread_messages += 1
+                    if m.timestamp >= today:
+                        messages_today += 1
+                    if m.read_at and m.delivered_at:
+                        latency_sum += (m.read_at - m.delivered_at).total_seconds() * 1000
+                        read_count += 1
+            return {
+                "total_agents": total_agents,
+                "online_agents": online_agents,
+                "total_messages": total_messages,
+                "unread_messages": unread_messages,
+                "messages_today": messages_today,
+                "avg_read_latency_ms": round(latency_sum / read_count, 2) if read_count else 0,
+            }
+
+    def admin_update_agent_labels(self, agent_id: str, labels: List[str]) -> bool:
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if not agent:
+                return False
+            agent.labels = labels
+            return True
 
 
 class RedisStore(BaseStore):
@@ -303,19 +399,46 @@ class RedisStore(BaseStore):
                 for member_id in group.members:
                     self._client.rpush(self._key("inbox", member_id), msg.model_dump_json())
 
-    def get_inbox(self, agent_id: str, since: Optional[datetime] = None) -> List[Message]:
+    def get_inbox(self, agent_id: str, since: Optional[datetime] = None, unread_only: bool = False) -> List[Message]:
         raw_list = self._client.lrange(self._key("inbox", agent_id), 0, -1)
         # filter out the placeholder "[]" if present
         msgs = [Message.model_validate_json(r) for r in raw_list if r != "[]"]
-        if since is None:
-            return msgs
-        return [m for m in msgs if m.timestamp > since]
+        if since is not None:
+            msgs = [m for m in msgs if m.timestamp > since]
+        if unread_only:
+            msgs = [m for m in msgs if m.read_at is None]
+        return msgs
 
     def get_message(self, agent_id: str, msg_id: str) -> Optional[Message]:
         for m in self.get_inbox(agent_id):
             if m.msg_id == msg_id:
                 return m
         return None
+
+    def mark_read(self, agent_id: str, msg_id: str) -> bool:
+        key = self._key("inbox", agent_id)
+        for i, raw in enumerate(self._client.lrange(key, 0, -1)):
+            if raw == "[]":
+                continue
+            m = Message.model_validate_json(raw)
+            if m.msg_id == msg_id and m.read_at is None:
+                m.read_at = datetime.now(timezone.utc)
+                self._client.lset(key, i, m.model_dump_json())
+                return True
+        return False
+
+    def mark_all_read(self, agent_id: str) -> int:
+        key = self._key("inbox", agent_id)
+        count = 0
+        for i, raw in enumerate(self._client.lrange(key, 0, -1)):
+            if raw == "[]":
+                continue
+            m = Message.model_validate_json(raw)
+            if m.read_at is None:
+                m.read_at = datetime.now(timezone.utc)
+                self._client.lset(key, i, m.model_dump_json())
+                count += 1
+        return count
 
     def create_group(self, name: str, created_by: str) -> Group:
         group_id = self._next_id("group")

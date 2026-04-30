@@ -186,6 +186,7 @@ async def get_inbox(
         for m in msgs:
             if m.read_at is None:
                 store.mark_read(agent, m.msg_id)
+                m.read_at = datetime.now(timezone.utc)
     return msgs
 
 
