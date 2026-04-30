@@ -29,6 +29,8 @@ class Message(BaseModel):
     content: MessageContent
     require_human_confirm: bool = False
     human_confirmed: Optional[bool] = None  # None=未处理, True=同意, False=拒绝
+    read_at: Optional[datetime] = None  # None=未读
+    delivered_at: Optional[datetime] = Field(default_factory=datetime.utcnow)
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -73,3 +75,7 @@ class CreateGroupRequest(BaseModel):
 class HumanConfirmRequest(BaseModel):
     decision: Literal["approve", "reject"]
     comment: str = ""
+
+
+class UpdateLabelsRequest(BaseModel):
+    labels: list[str]

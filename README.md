@@ -46,7 +46,9 @@ make redis
 REDIS_URL=redis://localhost:6379/0 make dev
 ```
 
-服务启动后，OpenAPI 文档位于 http://127.0.0.1:18080/docs。
+服务启动后：
+- OpenAPI 文档: http://127.0.0.1:18080/docs
+- **管理后台 Dashboard**: http://127.0.0.1:18080/admin-page/ — 可视化查看 Agent 列表、P2P 消息流、服务质量指标、在线状态
 
 ### 4. 运行客户端演示
 

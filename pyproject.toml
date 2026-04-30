@@ -8,5 +8,6 @@ dependencies = [
     "pydantic>=2.13.3",
     "redis>=7.4.0",
     "requests>=2.33.1",
+    "sqlalchemy>=2.0.40",
     "uvicorn>=0.46.0",
 ]

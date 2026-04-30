@@ -7,6 +7,7 @@ from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from agent_bus.models import (
     AgentCard,
@@ -18,6 +19,7 @@ from agent_bus.models import (
     RegisterResponse,
     SendRequest,
     SendResponse,
+    UpdateLabelsRequest,
 )
 from agent_bus.store import store
 
@@ -175,9 +177,28 @@ async def send_message(req: SendRequest, from_agent: AgentId):
 async def get_inbox(
     agent: AgentId,
     since: Annotated[Optional[float], Query()] = None,
+    unread_only: Annotated[bool, Query()] = False,
 ):
     since_dt = datetime.utcfromtimestamp(since) if since is not None else None
-    return store.get_inbox(agent, since=since_dt)
+    msgs = store.get_inbox(agent, since=since_dt, unread_only=unread_only)
+    # Auto-mark as read on first fetch (unless explicitly filtering unread)
+    if not unread_only:
+        for m in msgs:
+            if m.read_at is None:
+                store.mark_read(agent, m.msg_id)
+    return msgs
+
+
+@router.post("/messages/{msg_id}/read")
+async def mark_read(msg_id: str, agent: AgentId):
+    ok = store.mark_read(agent, msg_id)
+    return {"ok": ok, "msg_id": msg_id}
+
+
+@router.post("/messages/read-all")
+async def mark_all_read(agent: AgentId):
+    count = store.mark_all_read(agent)
+    return {"ok": True, "marked_count": count}
 
 
 @router.post("/messages/{msg_id}/confirm")
@@ -390,4 +411,90 @@ async def health():
     return {"status": "ok", "agents": len(store.list_agents()), "groups": len(store.list_groups())}
 
 
+# ---------- Admin Dashboard APIs ----------
+
+admin_router = APIRouter(prefix="/admin")
+
+
+@admin_router.get("/stats")
+async def admin_stats():
+    if hasattr(store, "admin_get_stats"):
+        return store.admin_get_stats()
+    return {
+        "total_agents": len(store.list_agents()),
+        "online_agents": sum(1 for a in store.list_agents() if a.online),
+        "total_messages": 0,
+        "unread_messages": 0,
+        "messages_today": 0,
+        "avg_read_latency_ms": 0,
+    }
+
+
+@admin_router.get("/agents")
+async def admin_list_agents():
+    agents = store.list_agents()
+    result = []
+    for a in agents:
+        item = a.model_dump()
+        if hasattr(store, "get_inbox"):
+            unread = len(store.get_inbox(a.agent_id, unread_only=True))
+            item["unread_count"] = unread
+        else:
+            item["unread_count"] = 0
+        result.append(item)
+    return result
+
+
+@admin_router.get("/agents/{agent_id}")
+async def admin_get_agent(agent_id: str):
+    card = store.get_agent(agent_id)
+    if not card:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    result = card.model_dump()
+    if hasattr(store, "get_inbox"):
+        result["recent_messages"] = [m.model_dump() for m in store.get_inbox(agent_id)[:20]]
+    return result
+
+
+@admin_router.patch("/agents/{agent_id}")
+async def admin_update_agent(agent_id: str, req: UpdateLabelsRequest):
+    if hasattr(store, "admin_update_agent_labels"):
+        ok = store.admin_update_agent_labels(agent_id, req.labels)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return {"ok": True, "agent_id": agent_id, "labels": req.labels}
+    raise HTTPException(status_code=501, detail="Store backend does not support label update")
+
+
+@admin_router.get("/messages")
+async def admin_list_messages(
+    from_agent: Annotated[Optional[str], Query()] = None,
+    to: Annotated[Optional[str], Query()] = None,
+    since: Annotated[Optional[float], Query()] = None,
+    msg_type: Annotated[Optional[str], Query()] = None,
+):
+    if hasattr(store, "admin_list_messages"):
+        since_dt = datetime.utcfromtimestamp(since) if since is not None else None
+        msgs = store.admin_list_messages(from_agent=from_agent, to=to, since=since_dt, msg_type=msg_type)
+        return [m.model_dump() for m in msgs]
+    raise HTTPException(status_code=501, detail="Store backend does not support global message listing")
+
+
+@admin_router.get("/messages/{msg_id}")
+async def admin_get_message(msg_id: str):
+    # Try to find message in any agent's inbox (inefficient for memory store, ok for SQLite)
+    if hasattr(store, "admin_list_messages"):
+        msgs = store.admin_list_messages()
+        for m in msgs:
+            if m.msg_id == msg_id:
+                return m.model_dump()
+    raise HTTPException(status_code=404, detail="Message not found")
+
+
 app.include_router(router)
+app.include_router(admin_router)
+
+# ---------- Static files for Admin Dashboard ----------
+_ADMIN_DIR = Path(__file__).parent / "admin"
+if _ADMIN_DIR.exists():
+    app.mount("/admin-page", StaticFiles(directory=str(_ADMIN_DIR), html=True), name="admin-page")
