@@ -1,6 +1,8 @@
 """Agent Bus MVP — FastAPI service."""
 from __future__ import annotations
 
+import asyncio
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,7 +10,9 @@ from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from sse_starlette.sse import EventSourceResponse
 
 from agent_bus.models import (
     AckRequest,
@@ -31,6 +35,7 @@ from agent_bus.models import (
 )
 from agent_bus.push_engine import PushDeliveryEngine, get_push_engine, set_push_engine
 from agent_bus.store import BaseStore, get_store, store
+from agent_bus.stream_manager import get_stream_manager, StreamManager
 
 # ---------- Skill discovery — auto-generated from examples/ ----------
 
@@ -104,6 +109,7 @@ app.add_middleware(
 )
 
 router = APIRouter(prefix="/v1/switchboard")
+stream_manager = get_stream_manager()
 
 
 # ---------- Auth dependency ----------
@@ -219,6 +225,18 @@ async def send_message(req: SendRequest, from_agent: AgentId):
         raise HTTPException(status_code=400, detail="Invalid recipient ID")
 
     store.add_message(msg)
+
+    # SSE real-time push
+    if msg.to.startswith("agent_"):
+        await stream_manager.publish_message(msg)
+    elif msg.to.startswith("group_"):
+        group = store.get_group(msg.to)
+        if group:
+            for member_id in group.members:
+                await stream_manager.publish(member_id, {
+                    "event": "message.received",
+                    "message": msg.model_dump(mode="json"),
+                })
 
     # Determine delivery channel for the primary recipient
     delivery_channel = "pull"
@@ -498,6 +516,7 @@ async def root():
             {"name": "人类确认消息", "method": "POST", "endpoint": "/v1/switchboard/messages/{msg_id}/confirm"},
             {"name": "推送通知配置", "method": "POST/GET/DELETE", "endpoint": "/v1/switchboard/webhook"},
             {"name": "消息回执确认", "method": "POST", "endpoint": "/v1/switchboard/messages/{msg_id}/ack"},
+        {"name": "实时消息流 (SSE)", "method": "GET", "endpoint": "/v1/switchboard/stream"},
         ],
         "sdk_url": "/sdk",
     }
@@ -513,9 +532,26 @@ async def discover():
     return _SKILL_DISCOVERY
 
 
+@router.get("/stream")
+async def stream(agent: AgentId):
+    """SSE endpoint — real-time message streaming."""
+    queue = await stream_manager.connect(agent)
+
+    async def event_generator():
+        try:
+            while True:
+                data = await queue.get()
+                yield {"event": "message", "data": json.dumps(data)}
+        except asyncio.CancelledError:
+            await stream_manager.disconnect(agent, queue)
+            raise
+
+    return EventSourceResponse(event_generator())
+
+
 @router.get("/health")
 async def health():
-    return {"status": "ok", "agents": len(store.list_agents()), "groups": len(store.list_groups()), "push_enabled": get_push_engine() is not None}
+    return {"status": "ok", "agents": len(store.list_agents()), "groups": len(store.list_groups()), "push_enabled": get_push_engine() is not None, "sse_connections": (await stream_manager.stats())["total_connections"]}
 
 
 # ---------- Admin Dashboard APIs ----------

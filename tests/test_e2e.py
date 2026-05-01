@@ -214,7 +214,46 @@ def run_suite(backend_name: str, env: dict):
             return False
         assert wh["webhook"]["url"] == f"{WEBHOOK_URL}/webhook"
 
-        # 5. Alice -> Bob P2P with Push
+        # 5. SSE streaming test
+        import threading
+        import http.client
+        sse_events = []
+        sse_conn = None
+
+        def read_sse():
+            nonlocal sse_conn
+            try:
+                sse_conn = http.client.HTTPConnection("127.0.0.1", 18087)
+                sse_conn.request(
+                    "GET", "/v1/switchboard/stream",
+                    headers={"X-Agent-Id": bob_id, "X-Token": bob_token},
+                )
+                resp = sse_conn.getresponse()
+                while True:
+                    line = resp.readline()
+                    if not line:
+                        break
+                    if line.startswith(b"data: "):
+                        sse_events.append(json.loads(line[6:].decode()))
+            except Exception as e:
+                print(f"  SSE reader error: {e}")
+            finally:
+                if sse_conn:
+                    sse_conn.close()
+
+        sse_thread = threading.Thread(target=read_sse, daemon=True)
+        sse_thread.start()
+        # Wait for SSE connection to be established (poll health endpoint)
+        for _ in range(20):
+            time.sleep(0.2)
+            _, h = api("GET", "/v1/switchboard/health")
+            if h.get("sse_connections", 0) >= 1:
+                break
+        else:
+            print("  ⚠️ SSE connection not detected in health, continuing anyway")
+        time.sleep(0.5)
+
+        # 6. Alice -> Bob P2P with Push + SSE
         status, send_res = api("POST", "/v1/switchboard/send", headers={
             "X-Agent-Id": alice_id,
             "X-Token": alice_token,
@@ -228,10 +267,21 @@ def run_suite(backend_name: str, env: dict):
         assert send_res.get("delivery_channel") == "push", f"expected push, got {send_res}"
         msg_id = send_res["msg_id"]
 
-        # Wait for push to be delivered (scheduler polls every 1s)
-        time.sleep(2.5)
+        # Give SSE some time to receive
+        time.sleep(1.0)
 
-        # 6. Verify webhook received the push
+        # 7. Verify SSE received the message in real-time
+        assert len(sse_events) >= 1, f"expected SSE events, got {sse_events}"
+        sse_body = sse_events[0]
+        assert sse_body["event"] == "message.received"
+        assert sse_body["message"]["msg_id"] == msg_id
+
+        # Close SSE connection gracefully
+        if sse_conn:
+            sse_conn.close()
+
+        # 8. Verify webhook also received the push
+        time.sleep(1.5)  # wait for webhook push scheduler
         status, wh_events = webhook_api("GET", "/events")
         if not ok(status, wh_events, "webhook events"):
             return False
@@ -243,7 +293,7 @@ def run_suite(backend_name: str, env: dict):
         # Verify auth header was sent
         assert events[0]["headers"].get("x-webhook-token") == "whk_bob_secret"
 
-        # 7. Verify delivery status
+        # 9. Verify delivery status
         status, delivery = api("GET", f"/admin/delivery?agent_id={bob_id}&msg_id={msg_id}")
         if not ok(status, delivery, "delivery status after push"):
             return False
@@ -252,7 +302,7 @@ def run_suite(backend_name: str, env: dict):
         assert records[0]["status"] == "delivered", f"expected delivered, got {records[0]}"
         assert records[0]["channel"] == "push"
 
-        # 8. Bob inbox — Pull fallback still works
+        # 10. Bob inbox — Pull fallback still works
         status, inbox = api("GET", "/v1/switchboard/inbox", headers={
             "X-Agent-Id": bob_id,
             "X-Token": bob_token,
@@ -263,11 +313,11 @@ def run_suite(backend_name: str, env: dict):
         inbox_msg_ids = [m["msg_id"] for m in inbox]
         assert msg_id in inbox_msg_ids, f"msg {msg_id} not in inbox {inbox_msg_ids}"
 
-        # 9. Reset webhook to fail (500)
+        # 11. Reset webhook to fail (500)
         webhook_api("GET", "/config?code=500")
         webhook_api("POST", "/reset")
 
-        # 10. Alice -> Bob again (Push will fail)
+        # 12. Alice -> Bob again (Push will fail)
         status, send_res2 = api("POST", "/v1/switchboard/send", headers={
             "X-Agent-Id": alice_id,
             "X-Token": alice_token,
@@ -283,14 +333,14 @@ def run_suite(backend_name: str, env: dict):
         # Wait for retries (backoff: 2s + 4s + ...), give enough time
         time.sleep(15)
 
-        # 11. Verify webhook received attempts
+        # 13. Verify webhook received attempts
         status, wh_events2 = webhook_api("GET", "/events")
         if not ok(status, wh_events2, "webhook events after failures"):
             return False
         fail_events = [e for e in wh_events2.get("events", []) if e["body"]["message"]["msg_id"] == msg_id2]
         assert len(fail_events) >= 1, f"expected at least 1 failed push attempt, got {fail_events}"
 
-        # 12. Verify message moved to DLQ
+        # 14. Verify message moved to DLQ
         status, dlq = api("GET", f"/admin/dlq?agent_id={bob_id}")
         if not ok(status, dlq, "dlq after push failures"):
             return False
@@ -298,7 +348,7 @@ def run_suite(backend_name: str, env: dict):
         dlq_msg_ids = [item["original_msg"]["msg_id"] for item in dlq_items]
         assert msg_id2 in dlq_msg_ids, f"msg {msg_id2} not in DLQ {dlq_msg_ids}"
 
-        # 13. Bob can still pull the failed message from inbox
+        # 15. Bob can still pull the failed message from inbox
         status, inbox2 = api("GET", "/v1/switchboard/inbox", headers={
             "X-Agent-Id": bob_id,
             "X-Token": bob_token,
@@ -308,7 +358,7 @@ def run_suite(backend_name: str, env: dict):
         inbox2_msg_ids = [m["msg_id"] for m in inbox2]
         assert msg_id2 in inbox2_msg_ids, f"msg {msg_id2} not in inbox {inbox2_msg_ids}"
 
-        # 14. Restore webhook to success, retry DLQ manually
+        # 16. Restore webhook to success, retry DLQ manually
         webhook_api("GET", "/config?code=200")
         status, retry_res = api("POST", f"/admin/dlq/{msg_id2}/retry?agent_id={bob_id}")
         if not ok(status, retry_res, "retry dlq"):
@@ -317,14 +367,14 @@ def run_suite(backend_name: str, env: dict):
         # Wait for retry push
         time.sleep(2.5)
 
-        # 15. Verify DLQ retry succeeded
+        # 17. Verify DLQ retry succeeded
         status, wh_events3 = webhook_api("GET", "/events")
         if not ok(status, wh_events3, "webhook events after dlq retry"):
             return False
         retry_events = [e for e in wh_events3.get("events", []) if e["body"]["message"]["msg_id"] == msg_id2]
         assert len(retry_events) >= 1, f"expected DLQ retry push, got {retry_events}"
 
-        # 16. Delete webhook, verify Bob becomes pull-only
+        # 18. Delete webhook, verify Bob becomes pull-only
         status, _ = api("DELETE", "/v1/switchboard/webhook", headers={
             "X-Agent-Id": bob_id,
             "X-Token": bob_token,
@@ -340,7 +390,7 @@ def run_suite(backend_name: str, env: dict):
             return False
         assert wh_after["webhook"] is None
 
-        # 17. Send to Bob (now pull-only)
+        # 19. Send to Bob (now pull-only)
         status, send_res3 = api("POST", "/v1/switchboard/send", headers={
             "X-Agent-Id": alice_id,
             "X-Token": alice_token,
@@ -353,13 +403,13 @@ def run_suite(backend_name: str, env: dict):
             return False
         assert send_res3.get("delivery_channel") == "pull", f"expected pull, got {send_res3}"
 
-        # 18. Admin stats still work
+        # 20. Admin stats still work
         status, stats = api("GET", "/admin/stats")
         if not ok(status, stats, "admin stats"):
             return False
         assert stats["total_agents"] == 2, f"stats wrong: {stats}"
 
-        # 19. Unregister Bob
+        # 21. Unregister Bob
         status, _ = api("DELETE", f"/v1/switchboard/agents/{bob_id}", headers={
             "X-Agent-Id": bob_id,
             "X-Token": bob_token,
