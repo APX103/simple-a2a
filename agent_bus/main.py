@@ -52,20 +52,33 @@ def _load_skill_text(filename: str) -> str:
 
 _SKILL_DISCOVERY = {
     "service": "Agent Bus",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "instruction": (
         "你是一个 AI Agent，需要将你自己接入 Agent Bus 协作网络，以便与其他 Agent 点对点通信、群组广播和能力发现。"
+        "Agent Bus 提供三种消息交付方式，请根据你的运行环境选择最适合的一种：\n"
+        "  • SSE 实时流 — 建立长连接，消息毫秒级送达（推荐常驻运行场景）\n"
+        "  • Webhook 推送 — 如果你有公网可达地址，Bus 主动 POST 推送\n"
+        "  • 轮询收件箱 — 每 30s 拉取，最通用，无需额外配置（保底机制）\n"
         "步骤如下：\n"
         "1. 根据你的客户端类型（kimi_code / claude_code / openclaw），从 skills 字段取出对应的 skill 配置字符串。\n"
         "2. 将 skill 配置保存到你客户端约定的 skill 目录（如 .kimi/skills/、.claude/skills/ 或 skills/agent-bus/）。\n"
-        "3. 配置环境变量 AGENT_BUS_URL（必填）、AGENT_BUS_NAME（可选）、AGENT_BUS_LABELS（可选）。\n"
-        "4. 按 skill 配置中的指引注册到 Agent Bus，并启动定时轮询收件箱。\n"
+        "3. 配置环境变量：AGENT_BUS_URL（必填）、AGENT_BUS_NAME（可选）、AGENT_BUS_LABELS（可选）、AGENT_BUS_MODE（可选，poll/webhook/sse）。\n"
+        "4. 按 skill 配置中的指引注册到 Agent Bus，选择交付方式并启动消息接收。\n"
         "5. 开始与其他 Agent 协作。"
     ),
     "env": {
         "AGENT_BUS_URL": "Agent Bus 服务地址，例如 http://127.0.0.1:10080/v1/switchboard",
         "AGENT_BUS_NAME": "本 Agent 的标识名称，例如 my-coder",
         "AGENT_BUS_LABELS": "标签，逗号分隔，例如 team:backend,lang:python",
+        "AGENT_BUS_MODE": "消息接收方式: poll(轮询,默认) / webhook(推送) / sse(实时流)",
+        "AGENT_BUS_WEBHOOK_URL": "webhook 模式必填 — 你的公网回调地址",
+    },
+    "delivery_modes": {
+        "push": {"description": "Webhook 推送 — Bus 主动 POST 到你的回调 URL"},
+        "sse": {"description": "SSE 实时流 — 建立长连接，消息毫秒级送达"},
+        "pull": {"description": "轮询收件箱 — GET /inbox 拉取消息"},
+        "both": {"description": "同时启用 push + pull（push 失败时 pull 兜底）"},
+        "all": {"description": "同时启用 push + sse + pull"},
     },
     "endpoints": {
         "register": {"method": "POST", "path": "/v1/switchboard/register", "description": "注册获取 agent_id 和 token"},
@@ -77,6 +90,7 @@ _SKILL_DISCOVERY = {
         "discover": {"method": "GET", "path": "/v1/switchboard/discover", "description": "本接口 — 返回 skill 配置和接入指南"},
         "webhook": {"method": "POST/GET/DELETE", "path": "/v1/switchboard/webhook", "description": "管理推送回调配置"},
         "ack": {"method": "POST", "path": "/v1/switchboard/messages/{msg_id}/ack", "description": "消息推送回执确认"},
+        "stream": {"method": "GET", "path": "/v1/switchboard/stream", "description": "SSE 实时消息流 — 建立长连接接收实时推送"},
     },
     "skills": {
         "kimi_code": _load_skill_text("kimi_code_skill.md"),
@@ -98,7 +112,7 @@ async def lifespan(app: FastAPI):
     set_push_engine(None)
 
 
-app = FastAPI(title="Agent Bus", version="1.1.0", description="Agent 原生协作层 — 让 Coding Agent 拥有身份、广播、点对点、群组的通信能力", lifespan=lifespan)
+app = FastAPI(title="Agent Bus", version="1.2.0", description="Agent 原生协作层 — 让 Coding Agent 拥有身份、广播、点对点、群组的通信能力", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -466,6 +480,33 @@ class AgentBusClient:
         r = requests.post(f"{self.base_url}/messages/{msg_id}/ack", json={"msg_id": msg_id}, headers=self._headers())
         r.raise_for_status()
         return r.json()
+
+    def stream(self, on_message=None, on_error=None):
+        """SSE 实时流连接 — 建立长连接接收实时消息推送。
+
+        Args:
+            on_message: 回调函数，收到消息时调用 on_message(msg_dict)
+            on_error: 回调函数，连接出错时调用 on_error(exception)
+        """
+        import json
+        try:
+            with requests.get(
+                f"{self.base_url}/stream",
+                headers=self._headers(),
+                stream=True,
+            ) as resp:
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    text = line.decode("utf-8")
+                    if text.startswith("data: "):
+                        data = json.loads(text[6:])
+                        if on_message:
+                            on_message(data)
+        except Exception as e:
+            if on_error:
+                on_error(e)
+            raise
 '''
 
 
@@ -473,7 +514,7 @@ class AgentBusClient:
 async def root():
     return {
         "service": "Agent Bus",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "description": "Agent 原生协作层 — 让 Coding Agent 拥有身份、广播、点对点、群组的通信能力",
         "docs_url": "/docs",
         "openapi_url": "/openapi.json",
