@@ -1,6 +1,7 @@
 """Agent Bus MVP — FastAPI service."""
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
@@ -10,8 +11,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from agent_bus.models import (
+    AckRequest,
     AgentCard,
     CreateGroupRequest,
+    DeadLetterMessage,
+    DeliveryRecord,
+    DeliveryStatusResponse,
+    DLQListResponse,
     Group,
     HumanConfirmRequest,
     Message,
@@ -20,8 +26,11 @@ from agent_bus.models import (
     SendRequest,
     SendResponse,
     UpdateLabelsRequest,
+    WebhookConfig,
+    WebhookSetRequest,
 )
-from agent_bus.store import store
+from agent_bus.push_engine import PushDeliveryEngine, get_push_engine, set_push_engine
+from agent_bus.store import BaseStore, get_store, store
 
 # ---------- Skill discovery — auto-generated from examples/ ----------
 
@@ -38,7 +47,7 @@ def _load_skill_text(filename: str) -> str:
 
 _SKILL_DISCOVERY = {
     "service": "Agent Bus",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "instruction": (
         "你是一个 AI Agent，需要将你自己接入 Agent Bus 协作网络，以便与其他 Agent 点对点通信、群组广播和能力发现。"
         "步骤如下：\n"
@@ -61,6 +70,8 @@ _SKILL_DISCOVERY = {
         "groups": {"method": "POST/GET", "path": "/v1/switchboard/groups", "description": "创建/管理群组"},
         "confirm": {"method": "POST", "path": "/v1/switchboard/messages/{msg_id}/confirm", "description": "人类确认消息"},
         "discover": {"method": "GET", "path": "/v1/switchboard/discover", "description": "本接口 — 返回 skill 配置和接入指南"},
+        "webhook": {"method": "POST/GET/DELETE", "path": "/v1/switchboard/webhook", "description": "管理推送回调配置"},
+        "ack": {"method": "POST", "path": "/v1/switchboard/messages/{msg_id}/ack", "description": "消息推送回执确认"},
     },
     "skills": {
         "kimi_code": _load_skill_text("kimi_code_skill.md"),
@@ -69,7 +80,20 @@ _SKILL_DISCOVERY = {
     },
 }
 
-app = FastAPI(title="Agent Bus", version="1.0.0", description="Agent 原生协作层")
+
+# ---------- Lifespan (start/stop Push Engine) ----------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    engine = PushDeliveryEngine(store)
+    set_push_engine(engine)
+    engine.start()
+    yield
+    await engine.stop()
+    set_push_engine(None)
+
+
+app = FastAPI(title="Agent Bus", version="1.1.0", description="Agent 原生协作层 — 让 Coding Agent 拥有身份、广播、点对点、群组的通信能力", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -107,6 +131,8 @@ async def register(req: RegisterRequest):
         limitations=req.limitations,
         announcement=req.announcement,
         labels=req.labels,
+        webhook=req.webhook,
+        delivery_preference=req.delivery_preference,
     )
     # broadcast system message to all other agents
     for other in store.list_agents():
@@ -117,7 +143,7 @@ async def register(req: RegisterRequest):
             msg_type="system",
             from_agent="system",
             to=other.agent_id,
-            content={"summary": f"Agent 上线: {card.name}", "detail": card.model_dump()},
+            content={"summary": f"Agent 上线: {card.name}", "detail": card.model_dump()},  # type: ignore[call-arg]
         ))
     return RegisterResponse(agent_id=agent_id, token=token, card=card)
 
@@ -137,12 +163,35 @@ async def get_agent(agent_id: str):
 
 @router.delete("/agents/{agent_id}")
 async def unregister_agent(agent_id: str, auth: AgentId):
-    # agents can only unregister themselves
     if auth != agent_id:
         raise HTTPException(status_code=403, detail="Can only unregister yourself")
     if store.unregister_agent(agent_id):
         return {"ok": True}
     raise HTTPException(status_code=404, detail="Agent not found")
+
+
+# ---------- Webhook management ----------
+
+@router.post("/webhook")
+async def set_webhook(req: WebhookSetRequest, agent: AgentId):
+    ok = store.set_agent_webhook(agent, req.webhook)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return {"ok": True, "agent_id": agent}
+
+
+@router.get("/webhook")
+async def get_webhook(agent: AgentId):
+    cfg = store.get_agent_webhook(agent)
+    return {"ok": True, "webhook": cfg.model_dump() if cfg else None}
+
+
+@router.delete("/webhook")
+async def delete_webhook(agent: AgentId):
+    ok = store.delete_agent_webhook(agent)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return {"ok": True}
 
 
 # ---------- Message Bus ----------
@@ -170,7 +219,24 @@ async def send_message(req: SendRequest, from_agent: AgentId):
         raise HTTPException(status_code=400, detail="Invalid recipient ID")
 
     store.add_message(msg)
-    return SendResponse(msg_id=msg_id, timestamp=msg.timestamp)
+
+    # Determine delivery channel for the primary recipient
+    delivery_channel = "pull"
+    if req.to.startswith("agent_"):
+        agent = store.get_agent(req.to)
+        if agent and agent.webhook and agent.webhook.enabled and agent.delivery_preference != "pull":
+            delivery_channel = "push"
+    elif req.to.startswith("group_"):
+        # For groups, report push if ANY member would be pushed (simplification)
+        group = store.get_group(req.to)
+        if group:
+            for member_id in group.members:
+                member = store.get_agent(member_id)
+                if member and member.webhook and member.webhook.enabled and member.delivery_preference != "pull":
+                    delivery_channel = "push"
+                    break
+
+    return SendResponse(msg_id=msg_id, timestamp=msg.timestamp, delivery_channel=delivery_channel)  # type: ignore[call-arg]
 
 
 @router.get("/inbox", response_model=list[Message])
@@ -187,12 +253,17 @@ async def get_inbox(
             if m.read_at is None:
                 store.mark_read(agent, m.msg_id)
                 m.read_at = datetime.now(timezone.utc)
+            # Also update delivery record if it was pushed
+            rec = store.get_delivery_record(m.msg_id, agent)
+            if rec and rec.status in ("pending", "delivered"):
+                store.update_delivery_pulled(m.msg_id, agent)
     return msgs
 
 
 @router.post("/messages/{msg_id}/read")
 async def mark_read(msg_id: str, agent: AgentId):
     ok = store.mark_read(agent, msg_id)
+    store.update_delivery_pulled(msg_id, agent)
     return {"ok": ok, "msg_id": msg_id}
 
 
@@ -214,6 +285,14 @@ async def human_confirm(msg_id: str, req: HumanConfirmRequest, agent: AgentId):
         "human_confirmed": msg.human_confirmed,
         "comment": req.comment,
     }
+
+
+@router.post("/messages/{msg_id}/ack")
+async def ack_message(msg_id: str, req: AckRequest, agent: AgentId):
+    if req.msg_id != msg_id:
+        raise HTTPException(status_code=400, detail="msg_id mismatch")
+    store.update_delivery_confirmed(msg_id, agent)
+    return {"ok": True, "msg_id": msg_id}
 
 
 # ---------- Groups ----------
@@ -244,7 +323,6 @@ async def join_group(group_id: str, agent: AgentId):
     if agent in group.members:
         raise HTTPException(status_code=400, detail="Already a member")
     store.join_group(group_id, agent)
-    # notify existing members
     for member_id in group.members:
         if member_id == agent:
             continue
@@ -253,7 +331,7 @@ async def join_group(group_id: str, agent: AgentId):
             msg_type="system",
             from_agent="system",
             to=member_id,
-            content={"summary": f"Agent {agent} joined group {group.name}", "detail": {"group_id": group_id, "agent_id": agent}},
+            content={"summary": f"Agent {agent} joined group {group.name}", "detail": {"group_id": group_id, "agent_id": agent}},  # type: ignore[call-arg]
         ))
     return {"ok": True, "group_id": group_id}
 
@@ -295,14 +373,18 @@ class AgentBusClient:
         self.agent_id: Optional[str] = None
         self.token: Optional[str] = None
 
-    def register(self, name: str, capabilities: list[str], limitations: list[str], announcement: str, labels: list[str] = None) -> dict:
-        r = requests.post(f"{self.base_url}/register", json={
+    def register(self, name: str, capabilities: list[str], limitations: list[str], announcement: str, labels: list[str] = None, webhook: dict = None, delivery_preference: str = "both") -> dict:
+        payload = {
             "name": name,
             "capabilities": capabilities,
             "limitations": limitations,
             "announcement": announcement,
             "labels": labels or [],
-        })
+            "delivery_preference": delivery_preference,
+        }
+        if webhook:
+            payload["webhook"] = webhook
+        r = requests.post(f"{self.base_url}/register", json=payload)
         r.raise_for_status()
         data = r.json()
         self.agent_id = data["agent_id"]
@@ -344,6 +426,28 @@ class AgentBusClient:
         r = requests.post(f"{self.base_url}/groups/{group_id}/join", headers=self._headers())
         r.raise_for_status()
         return r.json()
+
+    def set_webhook(self, url: str, token: str = "", auth_scheme: str = "none") -> dict:
+        r = requests.post(f"{self.base_url}/webhook", json={
+            "webhook": {"url": url, "token": token, "auth_scheme": auth_scheme, "enabled": True}
+        }, headers=self._headers())
+        r.raise_for_status()
+        return r.json()
+
+    def get_webhook(self) -> dict:
+        r = requests.get(f"{self.base_url}/webhook", headers=self._headers())
+        r.raise_for_status()
+        return r.json()
+
+    def delete_webhook(self) -> dict:
+        r = requests.delete(f"{self.base_url}/webhook", headers=self._headers())
+        r.raise_for_status()
+        return r.json()
+
+    def ack_message(self, msg_id: str) -> dict:
+        r = requests.post(f"{self.base_url}/messages/{msg_id}/ack", json={"msg_id": msg_id}, headers=self._headers())
+        r.raise_for_status()
+        return r.json()
 '''
 
 
@@ -351,7 +455,7 @@ class AgentBusClient:
 async def root():
     return {
         "service": "Agent Bus",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "description": "Agent 原生协作层 — 让 Coding Agent 拥有身份、广播、点对点、群组的通信能力",
         "docs_url": "/docs",
         "openapi_url": "/openapi.json",
@@ -370,6 +474,7 @@ async def root():
                 "capabilities": ["code_review", "debug"],
                 "limitations": ["不修改生产环境"],
                 "announcement": "一句话自我介绍",
+                "webhook": {"url": "https://your-agent.example.com/webhook", "token": "secret", "auth_scheme": "header_token"},
             },
             "response_example": {
                 "agent_id": "agent_xxx",
@@ -391,6 +496,8 @@ async def root():
             {"name": "轮询收件箱", "method": "GET", "endpoint": "/v1/switchboard/inbox"},
             {"name": "创建/管理群组", "method": "POST/GET", "endpoint": "/v1/switchboard/groups"},
             {"name": "人类确认消息", "method": "POST", "endpoint": "/v1/switchboard/messages/{msg_id}/confirm"},
+            {"name": "推送通知配置", "method": "POST/GET/DELETE", "endpoint": "/v1/switchboard/webhook"},
+            {"name": "消息回执确认", "method": "POST", "endpoint": "/v1/switchboard/messages/{msg_id}/ack"},
         ],
         "sdk_url": "/sdk",
     }
@@ -403,13 +510,12 @@ async def sdk():
 
 @router.get("/discover")
 async def discover():
-    """Agent 自发现接口 — 返回接入指南和可直接保存的 skill 配置。"""
     return _SKILL_DISCOVERY
 
 
 @router.get("/health")
 async def health():
-    return {"status": "ok", "agents": len(store.list_agents()), "groups": len(store.list_groups())}
+    return {"status": "ok", "agents": len(store.list_agents()), "groups": len(store.list_groups()), "push_enabled": get_push_engine() is not None}
 
 
 # ---------- Admin Dashboard APIs ----------
@@ -483,13 +589,41 @@ async def admin_list_messages(
 
 @admin_router.get("/messages/{msg_id}")
 async def admin_get_message(msg_id: str):
-    # Try to find message in any agent's inbox (inefficient for memory store, ok for SQLite)
     if hasattr(store, "admin_list_messages"):
         msgs = store.admin_list_messages()
         for m in msgs:
             if m.msg_id == msg_id:
                 return m.model_dump()
     raise HTTPException(status_code=404, detail="Message not found")
+
+
+# ---------- Admin delivery & DLQ APIs ----------
+
+@admin_router.get("/delivery")
+async def admin_list_delivery(
+    agent_id: Annotated[Optional[str], Query()] = None,
+    msg_id: Annotated[Optional[str], Query()] = None,
+):
+    """List delivery records. If agent_id + msg_id provided, returns single record."""
+    if msg_id and agent_id:
+        rec = store.get_delivery_record(msg_id, agent_id)
+        return {"records": [rec.model_dump()] if rec else []}
+    # For broader listing, we need a scan mechanism. In POC, we only support single lookup.
+    return {"records": []}
+
+
+@admin_router.get("/dlq")
+async def admin_list_dlq(agent_id: Annotated[Optional[str], Query()] = None):
+    items = store.list_dlq(agent_id=agent_id)
+    return {"items": [i.model_dump() for i in items]}
+
+
+@admin_router.post("/dlq/{msg_id}/retry")
+async def admin_retry_dlq(msg_id: str, agent_id: Annotated[str, Query()]):
+    ok = store.retry_dlq(msg_id, agent_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="DLQ message not found")
+    return {"ok": True, "msg_id": msg_id, "agent_id": agent_id}
 
 
 app.include_router(router)

@@ -16,7 +16,7 @@ demo:
 	@python examples/client_demo.py
 
 test:
-	@echo "No tests yet — add pytest to get started."
+	uv run pytest tests/ -v
 
 lint:
 	uv run ruff check agent_bus examples || true

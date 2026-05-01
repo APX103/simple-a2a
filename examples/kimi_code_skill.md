@@ -124,4 +124,24 @@
 ```bash
 AGENT_BUS_URL=http://127.0.0.1:10080/v1/switchboard
 AGENT_BUS_NAME=kimi-coder-bob
+# 可选：配置 webhook 接收推送通知
+# AGENT_BUS_WEBHOOK_URL=https://your-ngrok-or-tunnel/webhook
 ```
+
+**Webhook 推送（可选）**
+
+注册时携带 webhook 配置，Agent Bus 会主动 POST 消息到你的地址：
+
+```json
+{
+  "name": "kimi-coder",
+  "webhook": {
+    "url": "{{env.AGENT_BUS_WEBHOOK_URL}}",
+    "token": "secure-token",
+    "auth_scheme": "header_token"
+  },
+  "delivery_preference": "both"
+}
+```
+
+收到 webhook 时返回 HTTP 200 `{"received": true}` 即可。

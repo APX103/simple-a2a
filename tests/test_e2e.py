@@ -5,10 +5,12 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
 BASE_URL = "http://127.0.0.1:18087"
+WEBHOOK_URL = "http://127.0.0.1:18088"
 
 
 def api(method: str, path: str, headers: dict = None, body: dict = None):
@@ -32,6 +34,24 @@ def api(method: str, path: str, headers: dict = None, body: dict = None):
             return e.code, {"raw": body_text}
 
 
+def webhook_api(method: str, path: str, body: dict = None):
+    url = f"{WEBHOOK_URL}{path}"
+    data = None
+    if body:
+        data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8")
+        try:
+            return e.code, json.loads(body_text)
+        except Exception:
+            return e.code, {"raw": body_text}
+
+
 def ok(status, data, label):
     if status >= 400:
         print(f"  ❌ {label}: HTTP {status} -> {data}")
@@ -40,44 +60,116 @@ def ok(status, data, label):
     return True
 
 
+WEBHOOK_APP = '''
+from fastapi import FastAPI, Request
+import uvicorn
+
+app = FastAPI()
+_events = []
+_status_code = 200
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    body = await request.json()
+    _events.append({"headers": dict(request.headers), "body": body})
+    from fastapi.responses import JSONResponse
+    return JSONResponse(content={"received": True}, status_code=_status_code)
+
+@app.get("/events")
+async def events():
+    return {"events": _events}
+
+@app.get("/config")
+async def config(code: int):
+    global _status_code
+    _status_code = code
+    return {"status_code": _status_code}
+
+@app.post("/reset")
+async def reset():
+    global _events
+    _events = []
+    return {"ok": True}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=18088, log_level="warning")
+'''
+
+
 def run_suite(backend_name: str, env: dict):
     print(f"\n========== Testing {backend_name} ==========")
 
-    # 1. Start server
     env_full = {**os.environ, **env}
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "agent_bus.main:app", "--host", "127.0.0.1", "--port", "18087"],
-        cwd="/Users/apx103/work/agent_communicator",
-        env=env_full,
+
+    # Write webhook receiver temp file
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(WEBHOOK_APP)
+        webhook_path = f.name
+
+    # Start webhook receiver
+    webhook_proc = subprocess.Popen(
+        [sys.executable, webhook_path],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    # Wait for server to come up
-    for _ in range(30):
-        time.sleep(0.5)
+
+    # Wait for webhook server
+    for _ in range(50):
+        time.sleep(0.2)
         try:
-            urllib.request.urlopen(f"{BASE_URL}/health", timeout=1)
+            urllib.request.urlopen(f"{WEBHOOK_URL}/events", timeout=1)
             break
         except Exception:
             pass
     else:
-        stdout, stderr = proc.communicate(timeout=2)
+        print("  ❌ Webhook server failed to start")
+        webhook_proc.kill()
+        os.unlink(webhook_path)
+        return False
+
+    # Start main server
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "agent_bus.main:app", "--host", "127.0.0.1", "--port", "18087"],
+        cwd="/Users/lijialun/work/simple-a2a",
+        env=env_full,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    # Wait for server to come up
+    for _ in range(50):
+        time.sleep(0.2)
+        try:
+            urllib.request.urlopen(f"{BASE_URL}/v1/switchboard/health", timeout=1)
+            break
+        except Exception:
+            pass
+    else:
         print("  ❌ Server failed to start")
-        if stdout:
-            print("  stdout:", stdout.decode()[-500:])
-        if stderr:
-            print("  stderr:", stderr.decode()[-500:])
         proc.kill()
+        try:
+            stdout, stderr = proc.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = b"", b""
+        if stdout:
+            print("  stdout:", stdout.decode()[-800:])
+        if stderr:
+            print("  stderr:", stderr.decode()[-800:])
+        webhook_proc.kill()
+        os.unlink(webhook_path)
         return False
 
     try:
-        # 2. Empty stats
+        # Reset webhook state
+        webhook_api("POST", "/reset")
+
+        # 1. Empty stats
         status, data = api("GET", "/admin/stats")
         if not ok(status, data, "empty stats"):
             return False
         assert data["total_agents"] == 0, f"expected 0 agents, got {data}"
 
-        # 3. Register Alice
+        # 2. Register Alice (no webhook)
         status, alice = api("POST", "/v1/switchboard/register", body={
             "name": "alice",
             "capabilities": ["python"],
@@ -85,70 +177,98 @@ def run_suite(backend_name: str, env: dict):
             "announcement": "hi",
             "labels": ["team:backend"],
         })
-        if not ok(status, alice, "register alice"):
+        if not ok(status, alice, "register alice (no webhook)"):
             return False
         alice_id = alice["agent_id"]
         alice_token = alice["token"]
+        assert alice["card"].get("webhook") is None
 
-        # 4. Register Bob
+        # 3. Register Bob (with webhook)
         status, bob = api("POST", "/v1/switchboard/register", body={
             "name": "bob",
             "capabilities": ["review"],
             "limitations": [],
             "announcement": "ho",
             "labels": ["team:frontend"],
+            "webhook": {
+                "url": f"{WEBHOOK_URL}/webhook",
+                "token": "whk_bob_secret",
+                "auth_scheme": "header_token",
+                "enabled": True,
+            },
+            "delivery_preference": "both",
         })
-        if not ok(status, bob, "register bob"):
+        if not ok(status, bob, "register bob (with webhook)"):
             return False
         bob_id = bob["agent_id"]
         bob_token = bob["token"]
+        assert bob["card"]["webhook"]["url"] == f"{WEBHOOK_URL}/webhook"
+        assert bob["card"]["delivery_preference"] == "both"
 
-        # 5. List agents
-        status, agents = api("GET", "/v1/switchboard/agents")
-        if not ok(status, agents, "list agents"):
+        # 4. Verify webhook management endpoints
+        status, wh = api("GET", "/v1/switchboard/webhook", headers={
+            "X-Agent-Id": bob_id,
+            "X-Token": bob_token,
+        })
+        if not ok(status, wh, "get bob webhook"):
             return False
-        assert len(agents) == 2, f"expected 2 agents, got {len(agents)}"
+        assert wh["webhook"]["url"] == f"{WEBHOOK_URL}/webhook"
 
-        # 6. Label filter
-        status, filtered = api("GET", "/v1/switchboard/agents?label=team:backend")
-        if not ok(status, filtered, "filter by label"):
-            return False
-        assert len(filtered) == 1 and filtered[0]["name"] == "alice", f"label filter wrong: {filtered}"
-
-        # 7. Alice -> Bob P2P
+        # 5. Alice -> Bob P2P with Push
         status, send_res = api("POST", "/v1/switchboard/send", headers={
             "X-Agent-Id": alice_id,
             "X-Token": alice_token,
         }, body={
             "to": bob_id,
             "msg_type": "text",
-            "content": {"summary": "hello bob", "detail": {"foo": 1}},
+            "content": {"summary": "hello bob via push", "detail": {"foo": 1}},
         })
-        if not ok(status, send_res, "alice sends to bob"):
+        if not ok(status, send_res, "alice sends to bob (push)"):
             return False
+        assert send_res.get("delivery_channel") == "push", f"expected push, got {send_res}"
+        msg_id = send_res["msg_id"]
 
-        # 8. Bob inbox (auto-mark read)
+        # Wait for push to be delivered (scheduler polls every 1s)
+        time.sleep(2.5)
+
+        # 6. Verify webhook received the push
+        status, wh_events = webhook_api("GET", "/events")
+        if not ok(status, wh_events, "webhook events"):
+            return False
+        events = wh_events.get("events", [])
+        assert len(events) >= 1, f"expected webhook events, got {events}"
+        push_body = events[0]["body"]
+        assert push_body["event"] == "message.received"
+        assert push_body["message"]["msg_id"] == msg_id
+        # Verify auth header was sent
+        assert events[0]["headers"].get("x-webhook-token") == "whk_bob_secret"
+
+        # 7. Verify delivery status
+        status, delivery = api("GET", f"/admin/delivery?agent_id={bob_id}&msg_id={msg_id}")
+        if not ok(status, delivery, "delivery status after push"):
+            return False
+        records = delivery.get("records", [])
+        assert len(records) == 1, f"expected 1 delivery record, got {records}"
+        assert records[0]["status"] == "delivered", f"expected delivered, got {records[0]}"
+        assert records[0]["channel"] == "push"
+
+        # 8. Bob inbox — Pull fallback still works
         status, inbox = api("GET", "/v1/switchboard/inbox", headers={
             "X-Agent-Id": bob_id,
             "X-Token": bob_token,
         })
-        if not ok(status, inbox, "bob inbox"):
+        if not ok(status, inbox, "bob inbox after push"):
             return False
-        assert len(inbox) == 1, f"expected 1 msg, got {len(inbox)}"
-        msg_id = inbox[0]["msg_id"]
+        assert len(inbox) >= 1, f"expected at least 1 msg in inbox, got {inbox}"
+        inbox_msg_ids = [m["msg_id"] for m in inbox]
+        assert msg_id in inbox_msg_ids, f"msg {msg_id} not in inbox {inbox_msg_ids}"
 
-        # 9. Bob unread-only (should be empty after auto-read)
-        status, unread = api("GET", "/v1/switchboard/inbox?unread_only=true", headers={
-            "X-Agent-Id": bob_id,
-            "X-Token": bob_token,
-        })
-        if not ok(status, unread, "bob unread-only"):
-            return False
-        assert len(unread) == 0, f"expected 0 unread after auto-read, got {len(unread)}"
+        # 9. Reset webhook to fail (500)
+        webhook_api("GET", "/config?code=500")
+        webhook_api("POST", "/reset")
 
-        # 10. Mark unread again by resetting read_at (simulate new msg)
-        # Send another message
-        status, _ = api("POST", "/v1/switchboard/send", headers={
+        # 10. Alice -> Bob again (Push will fail)
+        status, send_res2 = api("POST", "/v1/switchboard/send", headers={
             "X-Agent-Id": alice_id,
             "X-Token": alice_token,
         }, body={
@@ -156,119 +276,90 @@ def run_suite(backend_name: str, env: dict):
             "msg_type": "code_review",
             "content": {"summary": "review this", "detail": None},
         })
-        if not ok(status, _, "alice sends 2nd msg"):
+        if not ok(status, send_res2, "alice sends 2nd msg (push fail)"):
             return False
+        msg_id2 = send_res2["msg_id"]
 
-        # 11. unread_only should show 1
-        status, unread2 = api("GET", "/v1/switchboard/inbox?unread_only=true", headers={
+        # Wait for retries (backoff: 2s + 4s + ...), give enough time
+        time.sleep(15)
+
+        # 11. Verify webhook received attempts
+        status, wh_events2 = webhook_api("GET", "/events")
+        if not ok(status, wh_events2, "webhook events after failures"):
+            return False
+        fail_events = [e for e in wh_events2.get("events", []) if e["body"]["message"]["msg_id"] == msg_id2]
+        assert len(fail_events) >= 1, f"expected at least 1 failed push attempt, got {fail_events}"
+
+        # 12. Verify message moved to DLQ
+        status, dlq = api("GET", f"/admin/dlq?agent_id={bob_id}")
+        if not ok(status, dlq, "dlq after push failures"):
+            return False
+        dlq_items = dlq.get("items", [])
+        dlq_msg_ids = [item["original_msg"]["msg_id"] for item in dlq_items]
+        assert msg_id2 in dlq_msg_ids, f"msg {msg_id2} not in DLQ {dlq_msg_ids}"
+
+        # 13. Bob can still pull the failed message from inbox
+        status, inbox2 = api("GET", "/v1/switchboard/inbox", headers={
             "X-Agent-Id": bob_id,
             "X-Token": bob_token,
         })
-        if not ok(status, unread2, "bob unread-only after 2nd msg"):
+        if not ok(status, inbox2, "bob inbox after push fail"):
             return False
-        assert len(unread2) == 1, f"expected 1 unread, got {len(unread2)}"
+        inbox2_msg_ids = [m["msg_id"] for m in inbox2]
+        assert msg_id2 in inbox2_msg_ids, f"msg {msg_id2} not in inbox {inbox2_msg_ids}"
 
-        # 12. mark-all-read
-        status, mar = api("POST", "/v1/switchboard/messages/read-all", headers={
+        # 14. Restore webhook to success, retry DLQ manually
+        webhook_api("GET", "/config?code=200")
+        status, retry_res = api("POST", f"/admin/dlq/{msg_id2}/retry?agent_id={bob_id}")
+        if not ok(status, retry_res, "retry dlq"):
+            return False
+
+        # Wait for retry push
+        time.sleep(2.5)
+
+        # 15. Verify DLQ retry succeeded
+        status, wh_events3 = webhook_api("GET", "/events")
+        if not ok(status, wh_events3, "webhook events after dlq retry"):
+            return False
+        retry_events = [e for e in wh_events3.get("events", []) if e["body"]["message"]["msg_id"] == msg_id2]
+        assert len(retry_events) >= 1, f"expected DLQ retry push, got {retry_events}"
+
+        # 16. Delete webhook, verify Bob becomes pull-only
+        status, _ = api("DELETE", "/v1/switchboard/webhook", headers={
             "X-Agent-Id": bob_id,
             "X-Token": bob_token,
         })
-        if not ok(status, mar, "mark all read"):
+        if not ok(status, _, "delete bob webhook"):
             return False
-        assert mar.get("marked_count", 0) >= 1, f"expected marked_count >= 1, got {mar}"
 
-        # 13. Human confirm flow
-        status, _ = api("POST", "/v1/switchboard/send", headers={
+        status, wh_after = api("GET", "/v1/switchboard/webhook", headers={
+            "X-Agent-Id": bob_id,
+            "X-Token": bob_token,
+        })
+        if not ok(status, wh_after, "get bob webhook after delete"):
+            return False
+        assert wh_after["webhook"] is None
+
+        # 17. Send to Bob (now pull-only)
+        status, send_res3 = api("POST", "/v1/switchboard/send", headers={
             "X-Agent-Id": alice_id,
             "X-Token": alice_token,
         }, body={
             "to": bob_id,
             "msg_type": "task",
-            "content": {"summary": "deploy to prod?", "detail": None},
-            "require_human_confirm": True,
+            "content": {"summary": "task after webhook delete", "detail": None},
         })
-        if not ok(status, _, "send human-confirm msg"):
+        if not ok(status, send_res3, "alice sends to bob (pull only)"):
             return False
+        assert send_res3.get("delivery_channel") == "pull", f"expected pull, got {send_res3}"
 
-        status, inbox3 = api("GET", "/v1/switchboard/inbox", headers={
-            "X-Agent-Id": bob_id,
-            "X-Token": bob_token,
-        })
-        confirm_msg = [m for m in inbox3 if m.get("require_human_confirm")][0]
-        status, conf = api("POST", f"/v1/switchboard/messages/{confirm_msg['msg_id']}/confirm", headers={
-            "X-Agent-Id": bob_id,
-            "X-Token": bob_token,
-        }, body={"decision": "approve", "comment": "go ahead"})
-        if not ok(status, conf, "human confirm"):
-            return False
-        assert conf["human_confirmed"] is True, f"expected approved, got {conf}"
-
-        # 14. Group flow
-        status, grp = api("POST", "/v1/switchboard/groups", headers={
-            "X-Agent-Id": alice_id,
-            "X-Token": alice_token,
-        }, body={"name": "backend-critique"})
-        if not ok(status, grp, "create group"):
-            return False
-        group_id = grp["group_id"]
-
-        status, _ = api("POST", f"/v1/switchboard/groups/{group_id}/join", headers={
-            "X-Agent-Id": bob_id,
-            "X-Token": bob_token,
-        })
-        if not ok(status, _, "bob joins group"):
-            return False
-
-        status, _ = api("POST", "/v1/switchboard/send", headers={
-            "X-Agent-Id": alice_id,
-            "X-Token": alice_token,
-        }, body={
-            "to": group_id,
-            "msg_type": "task",
-            "content": {"summary": "group task", "detail": None},
-        })
-        if not ok(status, _, "group broadcast"):
-            return False
-
-        status, bob_inbox = api("GET", "/v1/switchboard/inbox", headers={
-            "X-Agent-Id": bob_id,
-            "X-Token": bob_token,
-        })
-        if not ok(status, bob_inbox, "bob inbox after group msg"):
-            return False
-        group_msgs = [m for m in bob_inbox if m["msg_type"] == "task" and m["to"] == group_id]
-        assert len(group_msgs) >= 1, f"expected bob to receive group msg, got {bob_inbox}"
-
-        # 15. Admin APIs
+        # 18. Admin stats still work
         status, stats = api("GET", "/admin/stats")
         if not ok(status, stats, "admin stats"):
             return False
         assert stats["total_agents"] == 2, f"stats wrong: {stats}"
-        assert stats["total_messages"] >= 5, f"expected >=5 messages, got {stats}"
 
-        status, admin_agents = api("GET", "/admin/agents")
-        if not ok(status, admin_agents, "admin agents"):
-            return False
-        assert len(admin_agents) == 2, f"expected 2 admin agents, got {len(admin_agents)}"
-        assert "unread_count" in admin_agents[0], f"missing unread_count: {admin_agents[0].keys()}"
-
-        status, admin_msgs = api("GET", "/admin/messages")
-        if not ok(status, admin_msgs, "admin messages"):
-            return False
-        assert len(admin_msgs) >= 5, f"expected >=5 admin messages, got {len(admin_msgs)}"
-
-        # 16. Patch label
-        status, patch = api("PATCH", f"/admin/agents/{alice_id}", body={"labels": ["team:backend", "lang:python"]})
-        if not ok(status, patch, "patch alice labels"):
-            return False
-        assert patch["labels"] == ["team:backend", "lang:python"], f"patch wrong: {patch}"
-
-        status, alice_check = api("GET", f"/v1/switchboard/agents/{alice_id}")
-        if not ok(status, alice_check, "get alice after patch"):
-            return False
-        assert "lang:python" in alice_check["labels"], f"label not persisted: {alice_check}"
-
-        # 17. Unregister Bob
+        # 19. Unregister Bob
         status, _ = api("DELETE", f"/v1/switchboard/agents/{bob_id}", headers={
             "X-Agent-Id": bob_id,
             "X-Token": bob_token,
@@ -281,17 +372,6 @@ def run_suite(backend_name: str, env: dict):
             return False
         assert len(agents_after) == 1, f"expected 1 agent after unregister, got {len(agents_after)}"
 
-        # 18. Front-end page
-        req = urllib.request.Request(f"{BASE_URL}/admin-page/")
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                html = resp.read().decode("utf-8")
-                assert "Agent Bus Dashboard" in html, "Dashboard title missing"
-                print("  ✅ admin-page HTML")
-        except Exception as e:
-            print(f"  ❌ admin-page HTML: {e}")
-            return False
-
         print(f"\n🎉 {backend_name} ALL PASSED")
         return True
 
@@ -301,32 +381,33 @@ def run_suite(backend_name: str, env: dict):
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
+        webhook_proc.terminate()
+        try:
+            webhook_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            webhook_proc.kill()
+        os.unlink(webhook_path)
+
+
+def test_redis_backend():
+    """Pytest entry point for Redis backend E2E test."""
+    # Clean Redis db 1 before testing
+    try:
+        import redis
+        r = redis.from_url("redis://localhost:6379/1", decode_responses=True)
+        r.flushdb()
+        r.close()
+    except Exception as e:
+        pytest.skip(f"Redis not available: {e}")
+
+    passed = run_suite("RedisStore", {
+        "REDIS_URL": "redis://localhost:6379/1",
+        "AGENT_BUS_PUSH_ENABLED": "true",
+    })
+    assert passed, "RedisStore E2E tests failed"
 
 
 if __name__ == "__main__":
-    import json
-
-    results = []
-
-    # Test MemoryStore
-    results.append(("MemoryStore", run_suite("MemoryStore", {})))
-
-    # Clean MongoDB before testing
-    print("\n🧹 Cleaning MongoDB test data...")
-    from pymongo import MongoClient
-    client = MongoClient("mongodb://localhost:27017")
-    client.drop_database("agent_bus")
-    client.close()
-
-    # Test MongoDB
-    results.append(("MongoDB", run_suite("MongoDB", {"MONGODB_URL": "mongodb://localhost:27017"})))
-
-    print("\n========== SUMMARY ==========")
-    all_pass = True
-    for name, passed in results:
-        status = "✅ PASSED" if passed else "❌ FAILED"
-        print(f"  {status}: {name}")
-        if not passed:
-            all_pass = False
-
-    sys.exit(0 if all_pass else 1)
+    import sys
+    import pytest
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

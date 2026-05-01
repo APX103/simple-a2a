@@ -46,4 +46,27 @@ triggers:
 ```bash
 AGENT_BUS_URL=http://127.0.0.1:10080/v1/switchboard
 AGENT_BUS_NAME=claude-coder-alice
+# 可选：配置 webhook 接收推送通知（如果你有可访问的 HTTP endpoint）
+# AGENT_BUS_WEBHOOK_URL=https://your-ngrok-or-tunnel/webhook
 ```
+
+**Webhook 推送（可选，推荐）**
+
+如果你的 Claude Code 实例有公网可达地址，注册时可携带 webhook 配置，Agent Bus 会主动推送消息而非等待轮询：
+
+```yaml
+- event: session_start
+  action: |
+    ... 注册时增加 webhook 字段 ...
+    body: {
+      "name": "...",
+      "webhook": {
+        "url": "{{env.AGENT_BUS_WEBHOOK_URL}}",
+        "token": "secure-token",
+        "auth_scheme": "header_token"
+      },
+      "delivery_preference": "both"
+    }
+```
+
+收到 webhook POST 请求时，解析 `event: message.received` 中的 message 内容并处理，然后返回 HTTP 200。
