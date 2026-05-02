@@ -10,7 +10,7 @@ from typing import Optional
 
 import httpx
 
-from agent_bus.models import DeadLetterMessage, DeliveryRecord, Message, WebhookConfig
+from agent_bus.models import DeadLetterMessage, Message, WebhookConfig
 from agent_bus.store import BaseStore
 
 logger = logging.getLogger("agent_bus.push_engine")
@@ -44,6 +44,8 @@ class PushDeliveryEngine:
         self._scheduler_task: Optional[asyncio.Task] = None
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._shutdown = False
+        self._inflight: set[tuple[str, str]] = set()
+        self._inflight_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -52,6 +54,9 @@ class PushDeliveryEngine:
     def start(self) -> None:
         if not PUSH_ENABLED:
             logger.info("Push delivery is disabled (AGENT_BUS_PUSH_ENABLED=false).")
+            return
+        if self._scheduler_task is not None:
+            logger.warning("PushDeliveryEngine already started.")
             return
         logger.info("Starting PushDeliveryEngine (workers=%d, timeout=%.1fs, max_retry=%d)",
                     self.max_workers, self.timeout, self.max_retry)
@@ -71,8 +76,17 @@ class PushDeliveryEngine:
                 await self._scheduler_task
             except asyncio.CancelledError:
                 pass
+        # Wait for in-flight tasks with a timeout
+        if self._inflight_tasks:
+            logger.info("Waiting for %d in-flight push tasks...", len(self._inflight_tasks))
+            _, pending = await asyncio.wait(self._inflight_tasks, timeout=self.timeout + 5)
+            for task in pending:
+                task.cancel()
         if self._client:
             await self._client.aclose()
+        self._scheduler_task = None
+        self._inflight.clear()
+        self._inflight_tasks.clear()
         logger.info("PushDeliveryEngine stopped.")
 
     # ------------------------------------------------------------------
@@ -90,7 +104,13 @@ class PushDeliveryEngine:
                 for msg_id, agent_id in pending:
                     if self._shutdown:
                         break
-                    asyncio.create_task(self._dispatch(msg_id, agent_id))
+                    key = (msg_id, agent_id)
+                    if key in self._inflight:
+                        continue
+                    self._inflight.add(key)
+                    task = asyncio.create_task(self._dispatch(msg_id, agent_id))
+                    self._inflight_tasks.add(task)
+                    task.add_done_callback(lambda t, k=key: (self._inflight.discard(k), self._inflight_tasks.discard(t)))
             except Exception as exc:
                 logger.exception("Scheduler loop error: %s", exc)
             await asyncio.sleep(1.0)
@@ -99,8 +119,11 @@ class PushDeliveryEngine:
         """Dispatch a single push job with concurrency limit."""
         if self._semaphore is None or self._client is None:
             return
-        async with self._semaphore:
-            await self._run_push(msg_id, agent_id)
+        try:
+            async with self._semaphore:
+                await self._run_push(msg_id, agent_id)
+        except Exception as exc:
+            logger.exception("Dispatch error for msg=%s agent=%s: %s", msg_id, agent_id, exc)
 
     # ------------------------------------------------------------------
     # Push logic
@@ -124,7 +147,7 @@ class PushDeliveryEngine:
         record = self.store.get_delivery_record(msg_id, agent_id)
         attempts = record.attempts if record else 0
 
-        success = await self._push_one(msg, webhook)
+        success, error_detail = await self._push_one(msg, webhook)
 
         if success:
             logger.info("Push succeeded: msg=%s -> agent=%s (attempt=%d)", msg_id, agent_id, attempts + 1)
@@ -137,9 +160,9 @@ class PushDeliveryEngine:
 
         # Failure handling
         attempts += 1
-        last_error = f"HTTP push failed after {attempts} attempt(s)"
-        logger.warning("Push failed: msg=%s -> agent=%s (attempt=%d/%d)",
-                       msg_id, agent_id, attempts, self.max_retry)
+        last_error = error_detail or f"HTTP push failed after {attempts} attempt(s)"
+        logger.warning("Push failed: msg=%s -> agent=%s (attempt=%d/%d) error=%s",
+                       msg_id, agent_id, attempts, self.max_retry, last_error)
 
         if attempts >= self.max_retry:
             logger.error("Push max retry exceeded for msg=%s -> agent=%s; moving to DLQ.", msg_id, agent_id)
@@ -166,10 +189,10 @@ class PushDeliveryEngine:
         self.store.schedule_push(msg_id, agent_id, retry_at)
         logger.info("Push retry scheduled: msg=%s -> agent=%s in %.1fs", msg_id, agent_id, backoff)
 
-    async def _push_one(self, msg: Message, webhook: WebhookConfig) -> bool:
-        """Execute single HTTP POST to webhook URL. Returns True on 2xx."""
+    async def _push_one(self, msg: Message, webhook: WebhookConfig) -> tuple[bool, str]:
+        """Execute single HTTP POST to webhook URL. Returns (success, error_detail)."""
         if self._client is None:
-            return False
+            return False, "Client not initialized"
 
         payload = {
             "event": "message.received",
@@ -179,7 +202,7 @@ class PushDeliveryEngine:
 
         headers = {
             "Content-Type": "application/json",
-            "X-Agent-Bus-Version": "1.1.0",
+            "X-Agent-Bus-Version": "1.2.0",
         }
         if webhook.auth_scheme == "bearer" and webhook.token:
             headers["Authorization"] = f"Bearer {webhook.token}"
@@ -187,20 +210,24 @@ class PushDeliveryEngine:
             headers["X-Webhook-Token"] = webhook.token
 
         try:
-            resp = await self._client.post(webhook.url, json=payload, headers=headers)
+            resp = await self._client.post(str(webhook.url), json=payload, headers=headers)
             if 200 <= resp.status_code < 300:
-                return True
+                return True, ""
+            error = f"HTTP {resp.status_code}"
             logger.warning("Webhook returned HTTP %d for %s", resp.status_code, webhook.url)
-            return False
+            return False, error
         except httpx.TimeoutException:
             logger.warning("Webhook timeout for %s", webhook.url)
-            return False
-        except httpx.ConnectError:
-            logger.warning("Webhook connection error for %s", webhook.url)
-            return False
+            return False, "Timeout"
+        except httpx.ConnectError as exc:
+            logger.warning("Webhook connection error for %s: %s", webhook.url, exc)
+            return False, f"ConnectError: {exc}"
+        except httpx.NetworkError as exc:
+            logger.warning("Webhook network error for %s: %s", webhook.url, exc)
+            return False, f"NetworkError: {exc}"
         except Exception as exc:
             logger.warning("Webhook unexpected error for %s: %s", webhook.url, exc)
-            return False
+            return False, f"Unexpected: {exc}"
 
 
 # Global instance (initialized in main.py lifespan)

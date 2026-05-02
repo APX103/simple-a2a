@@ -1,14 +1,14 @@
 """Store backends for Agent Bus — memory (default), Redis, or MongoDB."""
 from __future__ import annotations
 
-import json
+import copy
 import os
 import secrets
 import threading
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from agent_bus.models import (
     AgentCard,
@@ -23,7 +23,7 @@ from agent_bus.models import (
 # ---------- Config ----------
 QUEUE_MAXLEN = int(os.getenv("AGENT_BUS_QUEUE_MAXLEN", "1000"))
 DLQ_MAXLEN = int(os.getenv("AGENT_BUS_DLQ_MAXLEN", "500"))
-PUSH_MAX_RETRY = int(os.getenv("AGENT_BUS_PUSH_MAX_RETRY", "3"))
+
 
 
 class BaseStore(ABC):
@@ -31,7 +31,7 @@ class BaseStore(ABC):
 
     @abstractmethod
     def register_agent(
-        self, name: str, capabilities: List[str], limitations: List[str], announcement: str, labels: List[str] = None, webhook: Optional[WebhookConfig] = None, delivery_preference: str = "both"
+        self, name: str, capabilities: List[str], limitations: List[str], announcement: str, labels: Optional[List[str]] = None, webhook: Optional[WebhookConfig] = None, delivery_preference: Literal["push", "sse", "pull", "both", "all"] = "both"
     ) -> tuple[str, str, AgentCard]:
         ...
 
@@ -134,6 +134,21 @@ class BaseStore(ABC):
         """Return list of (msg_id, agent_id) whose push scheduling time <= before."""
         ...
 
+    # ---------- Admin helpers ----------
+
+    @abstractmethod
+    def admin_list_messages(self, from_agent: Optional[str] = None, to: Optional[str] = None,
+                            since: Optional[datetime] = None, msg_type: Optional[str] = None) -> List[Message]:
+        ...
+
+    @abstractmethod
+    def admin_get_stats(self) -> dict:
+        ...
+
+    @abstractmethod
+    def admin_update_agent_labels(self, agent_id: str, labels: List[str]) -> bool:
+        ...
+
     @abstractmethod
     def schedule_push(self, msg_id: str, agent_id: str, retry_at: float) -> None:
         ...
@@ -152,6 +167,16 @@ class BaseStore(ABC):
 
     @abstractmethod
     def retry_dlq(self, msg_id: str, agent_id: str) -> bool:
+        ...
+
+    @abstractmethod
+    def update_message_confirm(self, msg_id: str, agent_id: str, confirmed: bool) -> bool:
+        """Persist human confirmation status for a message."""
+        ...
+
+    @abstractmethod
+    def get_message_confirm(self, msg_id: str, agent_id: str) -> Optional[bool]:
+        """Get human confirmation status for a message."""
         ...
 
 
@@ -181,7 +206,7 @@ class MemoryStore(BaseStore):
         return f"{prefix}_{ts}_{rand}_{self._counter}"
 
     def register_agent(
-        self, name: str, capabilities: List[str], limitations: List[str], announcement: str, labels: List[str] = None, webhook: Optional[WebhookConfig] = None, delivery_preference: str = "both"
+        self, name: str, capabilities: List[str], limitations: List[str], announcement: str, labels: Optional[List[str]] = None, webhook: Optional[WebhookConfig] = None, delivery_preference: Literal["push", "sse", "pull", "both", "all"] = "both"
     ) -> tuple[str, str, AgentCard]:
         with self._lock:
             agent_id = self._next_id("agent")
@@ -252,7 +277,9 @@ class MemoryStore(BaseStore):
                 if group:
                     for member_id in group.members:
                         if member_id in self._messages:
-                            self._messages[member_id].append(msg)
+                            self._messages[member_id].append(copy.deepcopy(msg))
+            else:
+                raise ValueError(f"Invalid message target: {msg.to}. Must start with 'agent_' or 'group_'")
 
     def get_inbox(self, agent_id: str, since: Optional[datetime] = None, unread_only: bool = False) -> List[Message]:
         with self._lock:
@@ -276,7 +303,7 @@ class MemoryStore(BaseStore):
         with self._lock:
             for m in self._messages.get(agent_id, []):
                 if m.msg_id == msg_id and m.read_at is None:
-                    m.read_at = datetime.utcnow()
+                    m.read_at = datetime.now(timezone.utc)
                     return True
             return False
 
@@ -285,7 +312,7 @@ class MemoryStore(BaseStore):
             count = 0
             for m in self._messages.get(agent_id, []):
                 if m.read_at is None:
-                    m.read_at = datetime.utcnow()
+                    m.read_at = datetime.now(timezone.utc)
                     count += 1
             return count
 
@@ -429,6 +456,30 @@ class MemoryStore(BaseStore):
                     return True
             return False
 
+    def update_message_confirm(self, msg_id: str, agent_id: str, confirmed: bool) -> bool:
+        with self._lock:
+            for m in self._messages.get(agent_id, []):
+                if m.msg_id == msg_id:
+                    m.human_confirmed = confirmed
+                    break
+            key = f"{msg_id}:{agent_id}"
+            rec = self._delivery.get(key)
+            if rec:
+                rec.human_confirmed = confirmed
+            else:
+                self._delivery[key] = DeliveryRecord(
+                    msg_id=msg_id, agent_id=agent_id, channel="pull", status="pulled",
+                    human_confirmed=confirmed,
+                )
+            return True
+
+    def get_message_confirm(self, msg_id: str, agent_id: str) -> Optional[bool]:
+        with self._lock:
+            for m in self._messages.get(agent_id, []):
+                if m.msg_id == msg_id:
+                    return m.human_confirmed
+            return None
+
     # ---------- Admin helpers ----------
 
     def admin_list_messages(self, from_agent: Optional[str] = None, to: Optional[str] = None,
@@ -463,7 +514,7 @@ class MemoryStore(BaseStore):
             total_messages = 0
             unread_messages = 0
             messages_today = 0
-            today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
             latency_sum = 0.0
             read_count = 0
             for msgs in self._messages.values():
@@ -521,7 +572,7 @@ class RedisStore(BaseStore):
         return f"{prefix}_{ts}_{rand}_{counter}"
 
     def register_agent(
-        self, name: str, capabilities: List[str], limitations: List[str], announcement: str, labels: List[str] = None, webhook: Optional[WebhookConfig] = None, delivery_preference: str = "both"
+        self, name: str, capabilities: List[str], limitations: List[str], announcement: str, labels: Optional[List[str]] = None, webhook: Optional[WebhookConfig] = None, delivery_preference: Literal["push", "sse", "pull", "both", "all"] = "both"
     ) -> tuple[str, str, AgentCard]:
         agent_id = self._next_id("agent")
         token = secrets.token_urlsafe(32)
@@ -589,10 +640,10 @@ class RedisStore(BaseStore):
             self._client.hset(self._key("agents"), agent_id, card.model_dump_json())
 
     def add_message(self, msg: Message) -> None:
-        now = datetime.now(timezone.utc)
         msg_data = msg.model_dump_json()
 
         def _add_to_agent(agent_id: str) -> None:
+            should_push = self._should_push(agent_id)
             # Write to bounded stream
             self._client.xadd(
                 self._key("stream", agent_id),
@@ -601,9 +652,9 @@ class RedisStore(BaseStore):
                 approximate=True,
             )
             # Record delivery status
-            self.set_delivery_status(msg.msg_id, agent_id, "push" if self._should_push(agent_id) else "pull", "pending")
+            self.set_delivery_status(msg.msg_id, agent_id, "push" if should_push else "pull", "pending")
             # Schedule push if applicable
-            if self._should_push(agent_id):
+            if should_push:
                 self.schedule_push(msg.msg_id, agent_id, time.time())
 
         if msg.to.startswith("agent_"):
@@ -613,12 +664,15 @@ class RedisStore(BaseStore):
             if group:
                 for member_id in group.members:
                     _add_to_agent(member_id)
+        else:
+            raise ValueError(f"Invalid message target: {msg.to}. Must start with 'agent_' or 'group_'")
 
     def _should_push(self, agent_id: str) -> bool:
         agent = self.get_agent(agent_id)
         if not agent or not agent.webhook or not agent.webhook.enabled:
             return False
-        if agent.delivery_preference == "pull":
+        pref = agent.delivery_preference
+        if pref in ("pull", "sse"):
             return False
         return True
 
@@ -773,16 +827,20 @@ class RedisStore(BaseStore):
             self._client.hset(self._key("delivery"), key, rec.model_dump_json())
 
     def list_pending_push(self, before: float) -> List[tuple[str, str]]:
-        """Return (msg_id, agent_id) whose scheduled time <= before."""
-        entries = self._client.zrangebyscore(self._key("pending_push"), 0, before, withscores=False)
+        """Atomically pop (msg_id, agent_id) whose scheduled time <= before using zpopmin."""
         result = []
-        for entry in entries:
-            parts = entry.split(":")
+        while True:
+            popped = self._client.zpopmin(self._key("pending_push"), count=1)
+            if not popped:
+                break
+            member, score = popped[0]
+            if score > before:
+                # Put it back and stop
+                self._client.zadd(self._key("pending_push"), {member: score})
+                break
+            parts = member.split(":")
             if len(parts) == 2:
                 result.append((parts[0], parts[1]))
-        # Remove fetched entries
-        if entries:
-            self._client.zrem(self._key("pending_push"), *entries)
         return result
 
     def schedule_push(self, msg_id: str, agent_id: str, retry_at: float) -> None:
@@ -843,6 +901,23 @@ class RedisStore(BaseStore):
             self.schedule_push(msg_id, agent_id, time.time())
             return True
         return False
+
+    def update_message_confirm(self, msg_id: str, agent_id: str, confirmed: bool) -> bool:
+        key = f"{msg_id}:{agent_id}"
+        rec = self.get_delivery_record(msg_id, agent_id)
+        if rec:
+            rec.human_confirmed = confirmed
+        else:
+            rec = DeliveryRecord(
+                msg_id=msg_id, agent_id=agent_id, channel="pull", status="pulled",
+                human_confirmed=confirmed,
+            )
+        self._client.hset(self._key("delivery"), key, rec.model_dump_json())
+        return True
+
+    def get_message_confirm(self, msg_id: str, agent_id: str) -> Optional[bool]:
+        rec = self.get_delivery_record(msg_id, agent_id)
+        return rec.human_confirmed if rec else None
 
     # ---------- Admin helpers ----------
 
@@ -978,10 +1053,10 @@ class MongoStore(BaseStore):
             labels=doc.get("labels", []),
             announcement=doc.get("announcement", ""),
             online=doc.get("online", True),
-            registered_at=doc.get("registered_at", datetime.utcnow()),
-            last_seen=doc.get("last_seen", datetime.utcnow()),
+            registered_at=doc.get("registered_at", datetime.now(timezone.utc)),
+            last_seen=doc.get("last_seen", datetime.now(timezone.utc)),
             webhook=webhook,
-            delivery_preference=doc.get("delivery_preference", "both"),
+            delivery_preference=doc.get("delivery_preference") or "both",
         )
 
     @staticmethod
@@ -995,8 +1070,8 @@ class MongoStore(BaseStore):
             require_human_confirm=doc.get("require_human_confirm", False),
             human_confirmed=doc.get("human_confirmed"),
             read_at=doc.get("read_at"),
-            delivered_at=doc.get("delivered_at", datetime.utcnow()),
-            timestamp=doc.get("timestamp", datetime.utcnow()),
+            delivered_at=doc.get("delivered_at", datetime.now(timezone.utc)),
+            timestamp=doc.get("timestamp", datetime.now(timezone.utc)),
         )
 
     @staticmethod
@@ -1006,11 +1081,11 @@ class MongoStore(BaseStore):
             name=doc["name"],
             members=doc.get("members", []),
             created_by=doc["created_by"],
-            created_at=doc.get("created_at", datetime.utcnow()),
+            created_at=doc.get("created_at", datetime.now(timezone.utc)),
         )
 
     def register_agent(
-        self, name: str, capabilities: List[str], limitations: List[str], announcement: str, labels: List[str] = None, webhook: Optional[WebhookConfig] = None, delivery_preference: str = "both"
+        self, name: str, capabilities: List[str], limitations: List[str], announcement: str, labels: Optional[List[str]] = None, webhook: Optional[WebhookConfig] = None, delivery_preference: Literal["push", "sse", "pull", "both", "all"] = "both"
     ) -> tuple[str, str, AgentCard]:
         agent_id = self._next_id("agent")
         token = secrets.token_urlsafe(32)
@@ -1095,7 +1170,7 @@ class MongoStore(BaseStore):
             if group:
                 docs = []
                 for member_id in group.get("members", []):
-                    docs.append({**base_doc, "msg_id": f"{msg.msg_id}_{member_id}", "to_agent_id": member_id})
+                    docs.append({**base_doc, "to_agent_id": member_id})
                 if docs:
                     self._messages.insert_many(docs)
                 for member_id in group.get("members", []):
@@ -1107,7 +1182,8 @@ class MongoStore(BaseStore):
         agent = self.get_agent(agent_id)
         if not agent or not agent.webhook or not agent.webhook.enabled:
             return False
-        if agent.delivery_preference == "pull":
+        pref = agent.delivery_preference
+        if pref in ("pull", "sse"):
             return False
         return True
 
@@ -1122,9 +1198,6 @@ class MongoStore(BaseStore):
 
     def get_message(self, agent_id: str, msg_id: str) -> Optional[Message]:
         doc = self._messages.find_one({"msg_id": msg_id, "to_agent_id": agent_id})
-        if doc:
-            return self._msg_from_doc(doc)
-        doc = self._messages.find_one({"msg_id": f"{msg_id}_{agent_id}", "to_agent_id": agent_id})
         if doc:
             return self._msg_from_doc(doc)
         return None
@@ -1144,6 +1217,9 @@ class MongoStore(BaseStore):
             {"to_agent_id": agent_id, "read_at": None},
             {"$set": {"read_at": datetime.now(timezone.utc)}}
         )
+        # Sync delivery records
+        for m in self.get_inbox(agent_id, unread_only=True):
+            self.update_delivery_pulled(m.msg_id, agent_id)
         return result.modified_count
 
     def create_group(self, name: str, created_by: str) -> Group:
@@ -1239,11 +1315,13 @@ class MongoStore(BaseStore):
         )
 
     def list_pending_push(self, before: float) -> List[tuple[str, str]]:
-        docs = self._pending_push.find({"retry_at": {"$lte": before}})
-        result = [(d["msg_id"], d["agent_id"]) for d in docs]
-        if result:
-            self._pending_push.delete_many({"retry_at": {"$lte": before}})
-        return result
+        with self._client.start_session() as session:
+            with session.start_transaction():
+                docs = list(self._pending_push.find({"retry_at": {"$lte": before}}, session=session))
+                result = [(d["msg_id"], d["agent_id"]) for d in docs]
+                if result:
+                    self._pending_push.delete_many({"retry_at": {"$lte": before}}, session=session)
+                return result
 
     def schedule_push(self, msg_id: str, agent_id: str, retry_at: float) -> None:
         self._pending_push.update_one(
@@ -1257,6 +1335,13 @@ class MongoStore(BaseStore):
 
     def add_dlq(self, dlq_msg: DeadLetterMessage) -> None:
         self._dlq.insert_one(dlq_msg.model_dump())
+        # Keep DLQ bounded: remove oldest entries if exceeded
+        count = self._dlq.count_documents({})
+        if count > DLQ_MAXLEN:
+            overflow = count - DLQ_MAXLEN
+            old_docs = self._dlq.find().sort("entered_dlq_at", 1).limit(overflow)
+            for doc in old_docs:
+                self._dlq.delete_one({"_id": doc["_id"]})
 
     def list_dlq(self, agent_id: Optional[str] = None) -> List[DeadLetterMessage]:
         query = {}
@@ -1271,6 +1356,18 @@ class MongoStore(BaseStore):
             self.schedule_push(msg_id, agent_id, time.time())
             return True
         return False
+
+    def update_message_confirm(self, msg_id: str, agent_id: str, confirmed: bool) -> bool:
+        self._delivery.update_one(
+            {"msg_id": msg_id, "agent_id": agent_id},
+            {"$set": {"human_confirmed": confirmed}},
+            upsert=True,
+        )
+        return True
+
+    def get_message_confirm(self, msg_id: str, agent_id: str) -> Optional[bool]:
+        rec = self.get_delivery_record(msg_id, agent_id)
+        return rec.human_confirmed if rec else None
 
     # ---------- Admin helpers ----------
 
@@ -1289,8 +1386,6 @@ class MongoStore(BaseStore):
         return [self._msg_from_doc(d) for d in docs]
 
     def admin_get_stats(self) -> dict:
-        from bson import CodecOptions
-
         total_agents = self._agents.count_documents({})
         online_agents = self._agents.count_documents({"online": True})
         total_messages = self._messages.count_documents({})

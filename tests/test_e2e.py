@@ -1,16 +1,21 @@
 """End-to-end smoke tests for Agent Bus backends."""
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
+from pathlib import Path
 
 BASE_URL = "http://127.0.0.1:18087"
 WEBHOOK_URL = "http://127.0.0.1:18088"
+ADMIN_TOKEN = "test-admin-token-12345"
+PROJECT_ROOT = str(Path(__file__).parent.parent)
 
 
 def api(method: str, path: str, headers: dict = None, body: dict = None):
@@ -19,7 +24,10 @@ def api(method: str, path: str, headers: dict = None, body: dict = None):
     if body:
         data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Content-Type", "application/json")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    if path.startswith("/admin/"):
+        req.add_header("X-Admin-Token", ADMIN_TOKEN)
     if headers:
         for k, v in headers.items():
             req.add_header(k, v)
@@ -99,67 +107,65 @@ if __name__ == "__main__":
 def run_suite(backend_name: str, env: dict):
     print(f"\n========== Testing {backend_name} ==========")
 
-    env_full = {**os.environ, **env}
+    env_full = {**os.environ, **env, "AGENT_BUS_ADMIN_TOKEN": ADMIN_TOKEN}
 
     # Write webhook receiver temp file
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(WEBHOOK_APP)
         webhook_path = f.name
 
-    # Start webhook receiver
-    webhook_proc = subprocess.Popen(
-        [sys.executable, webhook_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-    # Wait for webhook server
-    for _ in range(50):
-        time.sleep(0.2)
-        try:
-            urllib.request.urlopen(f"{WEBHOOK_URL}/events", timeout=1)
-            break
-        except Exception:
-            pass
-    else:
-        print("  ❌ Webhook server failed to start")
-        webhook_proc.kill()
-        os.unlink(webhook_path)
-        return False
-
-    # Start main server
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "agent_bus.main:app", "--host", "127.0.0.1", "--port", "18087"],
-        cwd="/Users/lijialun/work/simple-a2a",
-        env=env_full,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-    # Wait for server to come up
-    for _ in range(50):
-        time.sleep(0.2)
-        try:
-            urllib.request.urlopen(f"{BASE_URL}/v1/switchboard/health", timeout=1)
-            break
-        except Exception:
-            pass
-    else:
-        print("  ❌ Server failed to start")
-        proc.kill()
-        try:
-            stdout, stderr = proc.communicate(timeout=3)
-        except subprocess.TimeoutExpired:
-            stdout, stderr = b"", b""
-        if stdout:
-            print("  stdout:", stdout.decode()[-800:])
-        if stderr:
-            print("  stderr:", stderr.decode()[-800:])
-        webhook_proc.kill()
-        os.unlink(webhook_path)
-        return False
+    proc = None
+    webhook_proc = None
 
     try:
+        # Start webhook receiver
+        webhook_proc = subprocess.Popen(
+            [sys.executable, webhook_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        # Wait for webhook server
+        for _ in range(50):
+            time.sleep(0.2)
+            try:
+                urllib.request.urlopen(f"{WEBHOOK_URL}/events", timeout=1)
+                break
+            except Exception:
+                pass
+        else:
+            print("  ❌ Webhook server failed to start")
+            return False
+
+        # Start main server
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "agent_bus.main:app", "--host", "127.0.0.1", "--port", "18087"],
+            cwd=PROJECT_ROOT,
+            env=env_full,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        # Wait for server to come up
+        for _ in range(50):
+            time.sleep(0.2)
+            try:
+                urllib.request.urlopen(f"{BASE_URL}/v1/switchboard/health", timeout=1)
+                break
+            except Exception:
+                pass
+        else:
+            print("  ❌ Server failed to start")
+            try:
+                stdout, stderr = proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = b"", b""
+            if stdout:
+                print("  stdout:", stdout.decode()[-800:])
+            if stderr:
+                print("  stderr:", stderr.decode()[-800:])
+            return False
+
         # Reset webhook state
         webhook_api("POST", "/reset")
 
@@ -215,8 +221,6 @@ def run_suite(backend_name: str, env: dict):
         assert wh["webhook"]["url"] == f"{WEBHOOK_URL}/webhook"
 
         # 5. SSE streaming test
-        import threading
-        import http.client
         sse_events = []
         sse_conn = None
 
@@ -264,7 +268,7 @@ def run_suite(backend_name: str, env: dict):
         })
         if not ok(status, send_res, "alice sends to bob (push)"):
             return False
-        assert send_res.get("delivery_channel") == "push", f"expected push, got {send_res}"
+        assert "push" in send_res.get("delivery_channels", []), f"expected push in channels, got {send_res}"
         msg_id = send_res["msg_id"]
 
         # Give SSE some time to receive
@@ -401,7 +405,7 @@ def run_suite(backend_name: str, env: dict):
         })
         if not ok(status, send_res3, "alice sends to bob (pull only)"):
             return False
-        assert send_res3.get("delivery_channel") == "pull", f"expected pull, got {send_res3}"
+        assert "pull" in send_res3.get("delivery_channels", []), f"expected pull in channels, got {send_res3}"
 
         # 20. Admin stats still work
         status, stats = api("GET", "/admin/stats")

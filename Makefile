@@ -1,4 +1,4 @@
-.PHONY: install dev redis stop-redis demo test lint
+.PHONY: install dev redis stop-redis demo test test-e2e lint format clean
 
 install:
 	uv sync
@@ -18,6 +18,19 @@ demo:
 test:
 	uv run pytest tests/ -v
 
+test-e2e:
+	uv run pytest tests/test_e2e.py -v
+
 lint:
-	uv run ruff check agent_bus examples || true
-	uv run pyright agent_bus || true
+	uv run ruff check agent_bus examples
+	uv run pyright agent_bus
+
+format:
+	uv run ruff format agent_bus examples
+	uv run ruff check --fix agent_bus examples
+
+clean:
+	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	find . -type f -name '*.pyc' -delete 2>/dev/null || true
+	find . -type f -name '.pytest_cache' -delete 2>/dev/null || true
+	rm -rf .ruff_cache .pyright 2>/dev/null || true

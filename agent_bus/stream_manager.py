@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import copy
 import logging
-from typing import Dict, List, Optional, Set
+from typing import Dict, Optional, Set
 
 from agent_bus.models import Message
 
@@ -47,7 +47,8 @@ class StreamManager:
         count = 0
         for q in queues:
             try:
-                q.put_nowait(data)
+                # Deep copy to prevent subscriber mutation from affecting others
+                q.put_nowait(copy.deepcopy(data))
                 count += 1
             except asyncio.QueueFull:
                 logger.warning("SSE queue full for agent %s, dropping message", agent_id)
@@ -61,10 +62,11 @@ class StreamManager:
         }
         await self.publish(msg.to, payload)
 
-    def has_subscribers(self, agent_id: str) -> bool:
+    async def has_subscribers(self, agent_id: str) -> bool:
         """Check if an agent has active SSE connections."""
-        queues = self._queues.get(agent_id)
-        return bool(queues) if queues else False
+        async with self._lock:
+            queues = self._queues.get(agent_id)
+            return bool(queues) if queues else False
 
     async def stats(self) -> dict:
         """Return connection stats."""

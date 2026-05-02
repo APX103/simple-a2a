@@ -3,14 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
@@ -18,10 +19,6 @@ from agent_bus.models import (
     AckRequest,
     AgentCard,
     CreateGroupRequest,
-    DeadLetterMessage,
-    DeliveryRecord,
-    DeliveryStatusResponse,
-    DLQListResponse,
     Group,
     HumanConfirmRequest,
     Message,
@@ -30,12 +27,11 @@ from agent_bus.models import (
     SendRequest,
     SendResponse,
     UpdateLabelsRequest,
-    WebhookConfig,
     WebhookSetRequest,
 )
 from agent_bus.push_engine import PushDeliveryEngine, get_push_engine, set_push_engine
-from agent_bus.store import BaseStore, get_store, store
-from agent_bus.stream_manager import get_stream_manager, StreamManager
+from agent_bus.store import store
+from agent_bus.stream_manager import get_stream_manager
 
 # ---------- Skill discovery — auto-generated from examples/ ----------
 
@@ -131,9 +127,17 @@ stream_manager = get_stream_manager()
 async def require_agent(x_agent_id: Annotated[Optional[str], Header()] = None,
                         x_token: Annotated[Optional[str], Header()] = None) -> str:
     if not x_agent_id or not x_token:
-        raise HTTPException(status_code=401, detail="Missing X-Agent-Id or X-Token header")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing X-Agent-Id or X-Token header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     if not store.verify_token(x_agent_id, x_token):
-        raise HTTPException(status_code=403, detail="Invalid token")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     store.touch_agent(x_agent_id)
     return x_agent_id
 
@@ -218,7 +222,7 @@ async def delete_webhook(agent: AgentId):
 
 @router.post("/send", response_model=SendResponse)
 async def send_message(req: SendRequest, from_agent: AgentId):
-    msg_id = f"msg_{datetime.now(timezone.utc).timestamp()}"
+    msg_id = f"msg_{secrets.token_hex(8)}"
     msg = Message(
         msg_id=msg_id,
         msg_type=req.msg_type,
@@ -252,23 +256,31 @@ async def send_message(req: SendRequest, from_agent: AgentId):
                     "message": msg.model_dump(mode="json"),
                 })
 
-    # Determine delivery channel for the primary recipient
-    delivery_channel = "pull"
+    # Determine delivery channels for the primary recipient
+    delivery_channels: list[Literal["push", "sse", "pull"]] = ["pull"]
+    targets = []
     if req.to.startswith("agent_"):
-        agent = store.get_agent(req.to)
-        if agent and agent.webhook and agent.webhook.enabled and agent.delivery_preference != "pull":
-            delivery_channel = "push"
+        targets = [req.to]
     elif req.to.startswith("group_"):
-        # For groups, report push if ANY member would be pushed (simplification)
         group = store.get_group(req.to)
         if group:
-            for member_id in group.members:
-                member = store.get_agent(member_id)
-                if member and member.webhook and member.webhook.enabled and member.delivery_preference != "pull":
-                    delivery_channel = "push"
-                    break
+            targets = group.members
 
-    return SendResponse(msg_id=msg_id, timestamp=msg.timestamp, delivery_channel=delivery_channel)  # type: ignore[call-arg]
+    has_push = False
+    for target_id in targets:
+        agent = store.get_agent(target_id)
+        if agent and agent.webhook and agent.webhook.enabled:
+            pref = agent.delivery_preference
+            if pref in ("push", "both", "all"):
+                has_push = True
+
+    if has_push:
+        delivery_channels.append("push")
+    # SSE is always attempted if subscribers exist
+    if await stream_manager.has_subscribers(req.to):
+        delivery_channels.append("sse")
+
+    return SendResponse(msg_id=msg_id, timestamp=msg.timestamp, delivery_channels=delivery_channels)
 
 
 @router.get("/inbox", response_model=list[Message])
@@ -277,25 +289,18 @@ async def get_inbox(
     since: Annotated[Optional[float], Query()] = None,
     unread_only: Annotated[bool, Query()] = False,
 ):
-    since_dt = datetime.utcfromtimestamp(since) if since is not None else None
+    if since is not None and since < 0:
+        raise HTTPException(status_code=422, detail="since must be >= 0")
+    since_dt = datetime.fromtimestamp(since, tz=timezone.utc) if since is not None else None
     msgs = store.get_inbox(agent, since=since_dt, unread_only=unread_only)
-    # Auto-mark as read on first fetch (unless explicitly filtering unread)
-    if not unread_only:
-        for m in msgs:
-            if m.read_at is None:
-                store.mark_read(agent, m.msg_id)
-                m.read_at = datetime.now(timezone.utc)
-            # Also update delivery record if it was pushed
-            rec = store.get_delivery_record(m.msg_id, agent)
-            if rec and rec.status in ("pending", "delivered"):
-                store.update_delivery_pulled(m.msg_id, agent)
     return msgs
 
 
 @router.post("/messages/{msg_id}/read")
 async def mark_read(msg_id: str, agent: AgentId):
     ok = store.mark_read(agent, msg_id)
-    store.update_delivery_pulled(msg_id, agent)
+    if ok:
+        store.update_delivery_pulled(msg_id, agent)
     return {"ok": ok, "msg_id": msg_id}
 
 
@@ -310,11 +315,15 @@ async def human_confirm(msg_id: str, req: HumanConfirmRequest, agent: AgentId):
     msg = store.get_message(agent, msg_id)
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found in your inbox")
-    msg.human_confirmed = req.decision == "approve"
+    confirmed = req.decision == "approve"
+    msg.human_confirmed = confirmed
+    # Persist confirmation status via store layer if available
+    if hasattr(store, "update_message_confirm"):
+        store.update_message_confirm(msg_id, agent, confirmed)
     return {
         "ok": True,
         "msg_id": msg_id,
-        "human_confirmed": msg.human_confirmed,
+        "human_confirmed": confirmed,
         "comment": req.comment,
     }
 
@@ -376,6 +385,17 @@ async def leave_group(group_id: str, agent: AgentId):
     if agent not in group.members:
         raise HTTPException(status_code=400, detail="Not a member")
     store.leave_group(group_id, agent)
+    # Notify remaining members
+    for member_id in group.members:
+        if member_id == agent:
+            continue
+        store.add_message(Message(
+            msg_id=f"sys_{secrets.token_hex(4)}",
+            msg_type="system",
+            from_agent="system",
+            to=member_id,
+            content={"summary": f"Agent {agent} left group {group.name}", "detail": {"group_id": group_id, "agent_id": agent}},  # type: ignore[call-arg]
+        ))
     return {"ok": True, "group_id": group_id}
 
 
@@ -584,10 +604,11 @@ async def stream(agent: AgentId):
                 data = await queue.get()
                 yield {"event": "message", "data": json.dumps(data)}
         except asyncio.CancelledError:
-            await stream_manager.disconnect(agent, queue)
             raise
+        finally:
+            await stream_manager.disconnect(agent, queue)
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(event_generator(), ping=15)
 
 
 @router.get("/health")
@@ -597,7 +618,16 @@ async def health():
 
 # ---------- Admin Dashboard APIs ----------
 
-admin_router = APIRouter(prefix="/admin")
+# ---------- Admin auth ----------
+ADMIN_TOKEN = os.getenv("AGENT_BUS_ADMIN_TOKEN", "")
+
+async def require_admin(x_admin_token: Annotated[Optional[str], Header()] = None) -> None:
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=501, detail="Admin token not configured")
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+
+admin_router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
 
 
 @admin_router.get("/stats")
@@ -658,7 +688,9 @@ async def admin_list_messages(
     msg_type: Annotated[Optional[str], Query()] = None,
 ):
     if hasattr(store, "admin_list_messages"):
-        since_dt = datetime.utcfromtimestamp(since) if since is not None else None
+        if since is not None and since < 0:
+            raise HTTPException(status_code=422, detail="since must be >= 0")
+        since_dt = datetime.fromtimestamp(since, tz=timezone.utc) if since is not None else None
         msgs = store.admin_list_messages(from_agent=from_agent, to=to, since=since_dt, msg_type=msg_type)
         return [m.model_dump() for m in msgs]
     raise HTTPException(status_code=501, detail="Store backend does not support global message listing")

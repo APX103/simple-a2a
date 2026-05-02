@@ -1,12 +1,13 @@
 """Pydantic models for Agent Bus."""
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
-from pydantic import BaseModel, Field
+
+from pydantic import BaseModel, Field, HttpUrl
 
 
 class WebhookConfig(BaseModel):
     """Agent 的推送回调配置，对齐 A2A PushNotificationConfig."""
-    url: str = Field(..., description="Webhook 回调地址，Bus 将 POST 消息到此 URL")
+    url: HttpUrl = Field(..., description="Webhook 回调地址，Bus 将 POST 消息到此 URL")
     token: str = Field(default="", description="验证令牌，Bus 推送时带在 X-Webhook-Token 头")
     auth_scheme: Literal["bearer", "header_token", "none"] = Field(default="none")
     enabled: bool = Field(default=True)
@@ -20,11 +21,11 @@ class AgentCard(BaseModel):
     announcement: str = Field(default="", description="一句话自我介绍")
     labels: list[str] = Field(default_factory=list, description="标签，如 team:backend, lang:python")
     online: bool = Field(default=True, description="是否在线")
-    registered_at: datetime = Field(default_factory=datetime.utcnow)
-    last_seen: datetime = Field(default_factory=datetime.utcnow)
+    registered_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_seen: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     # === 新增字段 ===
     webhook: Optional[WebhookConfig] = Field(default=None, description="推送配置，为空则仅支持 Pull")
-    delivery_preference: Literal["push", "pull", "both"] = Field(default="both", description="首选交付方式")
+    delivery_preference: Literal["push", "sse", "pull", "both", "all"] = Field(default="both", description="首选交付方式: push/sse/pull/both/all")
 
 
 class MessageContent(BaseModel):
@@ -41,8 +42,8 @@ class Message(BaseModel):
     require_human_confirm: bool = False
     human_confirmed: Optional[bool] = None  # None=未处理, True=同意, False=拒绝
     read_at: Optional[datetime] = None  # None=未读
-    delivered_at: Optional[datetime] = Field(default_factory=datetime.utcnow)
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    delivered_at: Optional[datetime] = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class Group(BaseModel):
@@ -50,7 +51,7 @@ class Group(BaseModel):
     name: str
     members: list[str] = Field(default_factory=list)  # agent_ids
     created_by: str
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class RegisterRequest(BaseModel):
@@ -61,7 +62,7 @@ class RegisterRequest(BaseModel):
     labels: list[str] = Field(default_factory=list, description="标签，如 team:backend, lang:python")
     # === 新增字段 ===
     webhook: Optional[WebhookConfig] = Field(default=None, description="可选的推送回调配置")
-    delivery_preference: Literal["push", "pull", "both"] = Field(default="both")
+    delivery_preference: Literal["push", "sse", "pull", "both", "all"] = Field(default="both")
 
 
 class RegisterResponse(BaseModel):
@@ -80,7 +81,7 @@ class SendRequest(BaseModel):
 class SendResponse(BaseModel):
     msg_id: str
     timestamp: datetime
-    delivery_channel: Literal["push", "pull"] = Field(default="pull", description="实际使用的交付通道")
+    delivery_channels: list[Literal["push", "sse", "pull"]] = Field(default_factory=lambda: ["pull"], description="实际触发的交付通道列表")
 
 
 class CreateGroupRequest(BaseModel):
@@ -113,6 +114,7 @@ class DeliveryRecord(BaseModel):
     pushed_at: Optional[datetime] = None
     pulled_at: Optional[datetime] = None
     confirmed_at: Optional[datetime] = None
+    human_confirmed: Optional[bool] = None  # None=未处理, True=同意, False=拒绝
 
 
 class DeadLetterMessage(BaseModel):
@@ -120,7 +122,7 @@ class DeadLetterMessage(BaseModel):
     agent_id: str
     reason: Literal["max_retry_exceeded", "expired", "queue_overflow", "agent_offline"]
     failed_attempts: int
-    entered_dlq_at: datetime = Field(default_factory=datetime.utcnow)
+    entered_dlq_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class AckRequest(BaseModel):
